@@ -1,6 +1,14 @@
 CREATE TABLE IF NOT EXISTS shops (
     id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
+    pin  TEXT NOT NULL DEFAULT '1234'
+);
+
+CREATE TABLE IF NOT EXISTS staff_sessions (
+    token      TEXT PRIMARY KEY,
+    shop_id    INTEGER NOT NULL,
+    expires_at DATETIME NOT NULL,
+    FOREIGN KEY (shop_id) REFERENCES shops(id)
 );
 
 CREATE TABLE IF NOT EXISTS bottles (

@@ -1,0 +1,25 @@
+{
+  "name": "ボトルキープ",
+  "short_name": "ボトルキープ",
+  "description": "お気に入りのボトルをNFCで管理しよう",
+  "start_url": "/my-bottles",
+  "display": "standalone",
+  "background_color": "#0F0C16",
+  "theme_color": "#F5A623",
+  "orientation": "portrait-primary",
+  "lang": "ja",
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

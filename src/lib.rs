@@ -101,6 +101,22 @@ async fn extract_session_token() -> Option<String> {
 }
 
 #[cfg(feature = "ssr")]
+async fn extract_staff_token() -> Option<String> {
+    use axum::http::HeaderMap;
+    use leptos_axum::extract;
+
+    let headers = extract::<HeaderMap>().await.ok()?;
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .map(|s| s.trim())
+        .find(|s| s.starts_with("staff_session="))
+        .map(|s| s["staff_session=".len()..].to_string())
+}
+
+#[cfg(feature = "ssr")]
 async fn get_authenticated_customer(
     pool: &sqlx::SqlitePool,
 ) -> Result<Customer, ServerFnError> {
@@ -1074,4 +1090,95 @@ pub async fn passkey_discoverable_finish(
     );
 
     Ok(customer)
+}
+
+// ─── スタッフ認証 ─────────────────────────────────────────────
+
+#[server(StaffLogin, "/api")]
+pub async fn staff_login(pin: String) -> Result<i32, ServerFnError> {
+    use leptos::prelude::use_context;
+    use leptos_axum::ResponseOptions;
+    use chrono::{Duration, Utc};
+
+    let pool = use_context::<sqlx::SqlitePool>()
+        .ok_or_else(|| ServerFnError::new("DB not found"))?;
+
+    let shop_id: i32 = sqlx::query_scalar("SELECT id FROM shops WHERE pin = ?")
+        .bind(&pin)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .ok_or_else(|| ServerFnError::new("PINが違います"))?;
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let expires_at = Utc::now() + Duration::days(7);
+
+    sqlx::query("INSERT INTO staff_sessions (token, shop_id, expires_at) VALUES (?, ?, ?)")
+        .bind(&token)
+        .bind(shop_id)
+        .bind(expires_at)
+        .execute(&pool)
+        .await
+        .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    let resp = use_context::<ResponseOptions>()
+        .ok_or_else(|| ServerFnError::new("ResponseOptions not found"))?;
+    let cookie = format!("staff_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800");
+    resp.append_header(
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_str(&cookie)
+            .map_err(|e| ServerFnError::new(e.to_string()))?,
+    );
+
+    Ok(shop_id)
+}
+
+#[server(GetStaffSession, "/api")]
+pub async fn get_staff_session() -> Result<Option<i32>, ServerFnError> {
+    use leptos::prelude::use_context;
+
+    let pool = use_context::<sqlx::SqlitePool>()
+        .ok_or_else(|| ServerFnError::new("DB not found"))?;
+
+    let token = match extract_staff_token().await {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    let shop_id: Option<i32> = sqlx::query_scalar(
+        "SELECT shop_id FROM staff_sessions WHERE token = ? AND expires_at > datetime('now')"
+    )
+    .bind(&token)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|e| ServerFnError::new(e.to_string()))?;
+
+    Ok(shop_id)
+}
+
+#[server(StaffLogout, "/api")]
+pub async fn staff_logout() -> Result<(), ServerFnError> {
+    use leptos::prelude::use_context;
+    use leptos_axum::ResponseOptions;
+
+    let pool = use_context::<sqlx::SqlitePool>()
+        .ok_or_else(|| ServerFnError::new("DB not found"))?;
+
+    if let Some(token) = extract_staff_token().await {
+        sqlx::query("DELETE FROM staff_sessions WHERE token = ?")
+            .bind(&token)
+            .execute(&pool)
+            .await
+            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    }
+
+    let resp = use_context::<ResponseOptions>()
+        .ok_or_else(|| ServerFnError::new("ResponseOptions not found"))?;
+    resp.append_header(
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_str("staff_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+            .map_err(|e| ServerFnError::new(e.to_string()))?,
+    );
+
+    Ok(())
 }
