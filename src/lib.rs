@@ -1000,11 +1000,12 @@ pub async fn handler_analyze_bottle_image(
 
 #[derive(sqlx::FromRow)]
 struct ExpiringBottle {
-    guest_name: Option<String>,
-    drink_name: Option<String>,
-    email:      String,
-    expires_at: DateTime<Utc>,
-    shop_name:  String,
+    guest_name:     Option<String>,
+    drink_name:     Option<String>,
+    email:          String,
+    expires_at:     DateTime<Utc>,
+    shop_name:      String,
+    days_remaining: i32,
 }
 
 async fn send_expiry_email(to_email: &str, shop_name: &str, body: &str) -> Result<(), ApiError> {
@@ -1049,11 +1050,22 @@ async fn send_expiry_email(to_email: &str, shop_name: &str, body: &str) -> Resul
 
 async fn notify_expiring_bottles(pool: &SqlitePool) {
     let bottles = match sqlx::query_as::<_, ExpiringBottle>(
-        "SELECT b.guest_name, b.drink_name, b.email, b.expires_at, s.name as shop_name
+        "SELECT b.guest_name, b.drink_name, b.email, b.expires_at, s.name as shop_name,
+                CASE
+                    WHEN b.expires_at BETWEEN datetime('now', '+29 days') AND datetime('now', '+30 days') THEN 30
+                    WHEN b.expires_at BETWEEN datetime('now', '+6 days')  AND datetime('now', '+7 days')  THEN 7
+                    WHEN b.expires_at BETWEEN datetime('now', '+2 days')  AND datetime('now', '+3 days')  THEN 3
+                    WHEN b.expires_at BETWEEN datetime('now')             AND datetime('now', '+1 day')   THEN 0
+                END as days_remaining
          FROM bottles b
          JOIN shops s ON s.id = b.shop_id
          WHERE b.email IS NOT NULL
-         AND b.expires_at BETWEEN datetime('now', '+6 days') AND datetime('now', '+7 days')"
+         AND (
+             b.expires_at BETWEEN datetime('now', '+29 days') AND datetime('now', '+30 days')
+             OR b.expires_at BETWEEN datetime('now', '+6 days')  AND datetime('now', '+7 days')
+             OR b.expires_at BETWEEN datetime('now', '+2 days')  AND datetime('now', '+3 days')
+             OR b.expires_at BETWEEN datetime('now')             AND datetime('now', '+1 day')
+         )"
     )
     .fetch_all(pool)
     .await {
@@ -1067,18 +1079,27 @@ async fn notify_expiring_bottles(pool: &SqlitePool) {
     tracing::info!("期限通知対象: {}件", bottles.len());
 
     for bottle in bottles {
+        let timing = match bottle.days_remaining {
+            0  => "本日が期限です".to_string(),
+            3  => "3日後に期限が迫っています".to_string(),
+            7  => "1週間後に期限が迫っています".to_string(),
+            30 => "1ヶ月後に期限が迫っています".to_string(),
+            _  => continue,
+        };
+
         let body = format!(
-            "{}様\n\n{}の「{}」のボトルキープ期限が7日後に迫っています。\n\n期限: {}\n\nご来店お待ちしております。",
+            "{}様\n\n{}の「{}」のボトルキープ期限について\n\n{}\n\n期限: {}\n\nご来店お待ちしております。",
             bottle.guest_name.as_deref().unwrap_or("お客様"),
             bottle.shop_name,
             bottle.drink_name.as_deref().unwrap_or("ボトル"),
+            timing,
             bottle.expires_at.format("%Y年%m月%d日"),
         );
 
         if let Err(e) = send_expiry_email(&bottle.email, &bottle.shop_name, &body).await {
             tracing::error!("通知メール送信失敗 to {}: {}", bottle.email, e);
         } else {
-            tracing::info!("通知メール送信完了: {}", bottle.email);
+            tracing::info!("通知メール送信完了: {} ({}日前)", bottle.email, bottle.days_remaining);
         }
     }
 }
