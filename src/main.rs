@@ -16,10 +16,12 @@ use bottlekanri::{
     handler_staff_login, handler_staff_me, handler_staff_logout,
     handler_register_bottle, handler_get_shop_bottles, handler_update_bottle,
     handler_get_my_bottles, handler_link_bottle,
+    handler_analyze_bottle_image,
 };
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
     // ─── DB ──────────────────────────────────────────────────
@@ -106,6 +108,8 @@ async fn main() {
             get(handler_get_shop_bottles).post(handler_register_bottle)
         )
         .route("/v1/staff/bottles/{id}", patch(handler_update_bottle))
+        // AI画像解析
+        .route("/v1/staff/bottles/analyze-image", post(handler_analyze_bottle_image))
         // 顧客ボトル
         .route("/v1/customer/bottles",      get(handler_get_my_bottles))
         .route("/v1/customer/bottles/link", post(handler_link_bottle))

@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ボトル管理 テスト</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: sans-serif; background: #f5f5f5; color: #333; }
+    .container { max-width: 600px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 1.4rem; margin-bottom: 16px; }
+    h2 { font-size: 1.1rem; margin-bottom: 12px; color: #555; }
+    section { background: #fff; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+    input, select { width: 100%; padding: 8px; margin-bottom: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 1rem; }
+    button { padding: 10px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 1rem; margin-right: 8px; margin-bottom: 8px; }
+    .btn-primary { background: #4f46e5; color: #fff; }
+    .btn-secondary { background: #e5e7eb; color: #333; }
+    .btn-danger { background: #ef4444; color: #fff; }
+    .btn-success { background: #22c55e; color: #fff; }
+    .msg { padding: 8px; border-radius: 4px; margin-bottom: 8px; font-size: 0.9rem; }
+    .msg.ok { background: #dcfce7; color: #166534; }
+    .msg.err { background: #fee2e2; color: #991b1b; }
+    .hidden { display: none; }
+    .token-display { font-size: 0.75rem; color: #888; word-break: break-all; margin-top: 4px; }
+    .bottle-card { border: 1px solid #e5e7eb; border-radius: 6px; padding: 12px; margin-bottom: 8px; }
+    .bottle-card h3 { font-size: 1rem; margin-bottom: 4px; }
+    .bottle-card p { font-size: 0.85rem; color: #666; margin-bottom: 4px; }
+    .remaining-bar { height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
+    .remaining-fill { height: 100%; background: #4f46e5; transition: width 0.3s; }
+    #preview { width: 100%; max-height: 200px; object-fit: contain; border-radius: 4px; margin-bottom: 8px; display: none; }
+    label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 4px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>🍾 ボトル管理 テスト画面</h1>
+
+  <!-- ログイン -->
+  <section id="section-login">
+    <h2>スタッフログイン</h2>
+    <label>店舗ID</label>
+    <input type="number" id="shop-id" value="1">
+    <label>PIN</label>
+    <input type="password" id="pin" value="1234">
+    <button class="btn-primary" onclick="login()">ログイン</button>
+    <div id="login-msg"></div>
+  </section>
+
+  <!-- ログイン後のセクション -->
+  <div id="authenticated" class="hidden">
+    <section>
+      <h2>ログイン中</h2>
+      <p id="shop-name-display"></p>
+      <div class="token-display" id="token-display"></div>
+      <button class="btn-secondary" onclick="logout()">ログアウト</button>
+    </section>
+
+    <!-- AI画像解析 + ボトル登録 -->
+    <section>
+      <h2>ボトル登録</h2>
+
+      <label>カメラで撮影してAI解析</label>
+      <input type="file" accept="image/*" capture="environment" id="camera-input" onchange="analyzeImage(event)">
+      <img id="preview">
+      <div id="analyze-msg"></div>
+
+      <label>NFC UID（テスト用は適当でOK）</label>
+      <input type="text" id="reg-nfc-uid" placeholder="例: TAG-001">
+      <label>お客さん名</label>
+      <input type="text" id="reg-guest-name" placeholder="例: 山田 太郎">
+      <label>お酒の名前</label>
+      <input type="text" id="reg-drink-name" placeholder="例: 山崎12年">
+      <label>ブランド（参考用）</label>
+      <input type="text" id="reg-brand" placeholder="例: サントリー" readonly>
+      <label>種類（参考用）</label>
+      <input type="text" id="reg-spirit-type" placeholder="例: ウイスキー" readonly>
+      <label>期限（日数）</label>
+      <input type="number" id="reg-expires-days" value="90">
+      <label>メールアドレス（任意）</label>
+      <input type="email" id="reg-email" placeholder="customer@example.com">
+      <button class="btn-primary" onclick="registerBottle()">登録する</button>
+      <div id="register-msg"></div>
+    </section>
+
+    <!-- ボトル一覧 -->
+    <section>
+      <h2>ボトル一覧</h2>
+      <button class="btn-secondary" onclick="loadBottles()">更新</button>
+      <div id="bottles-list" style="margin-top:12px;"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+  const API = 'http://localhost:3000/v1';
+  let token = '';
+  let shopName = '';
+
+  function msg(id, text, type) {
+    const el = document.getElementById(id);
+    el.className = 'msg ' + type;
+    el.textContent = text;
+  }
+
+  async function login() {
+    const shopId = document.getElementById('shop-id').value;
+    const pin    = document.getElementById('pin').value;
+    const res = await fetch(`${API}/staff/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shop_id: parseInt(shopId), pin }),
+    });
+    const data = await res.json();
+    if (!res.ok) { msg('login-msg', data.error, 'err'); return; }
+    token    = data.token;
+    shopName = data.shop.name;
+    document.getElementById('shop-name-display').textContent = `店舗: ${shopName}`;
+    document.getElementById('token-display').textContent     = `token: ${token}`;
+    document.getElementById('section-login').classList.add('hidden');
+    document.getElementById('authenticated').classList.remove('hidden');
+    loadBottles();
+  }
+
+  function logout() {
+    fetch(`${API}/staff/logout`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+    token = '';
+    document.getElementById('section-login').classList.remove('hidden');
+    document.getElementById('authenticated').classList.add('hidden');
+  }
+
+  async function analyzeImage(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    // プレビュー表示
+    const preview = document.getElementById('preview');
+    preview.src = URL.createObjectURL(file);
+    preview.style.display = 'block';
+
+    msg('analyze-msg', '解析中...', 'ok');
+
+    // base64変換
+    const base64 = await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result.split(',')[1]);
+      reader.readAsDataURL(file);
+    });
+
+    const mediaType = file.type || 'image/jpeg';
+
+    const res = await fetch(`${API}/staff/bottles/analyze-image`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ image: base64, media_type: mediaType }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) { msg('analyze-msg', data.error, 'err'); return; }
+
+    // フォームに自動入力
+    if (data.name)        document.getElementById('reg-drink-name').value  = data.name;
+    if (data.brand)       document.getElementById('reg-brand').value       = data.brand;
+    if (data.spirit_type) document.getElementById('reg-spirit-type').value = data.spirit_type;
+
+    msg('analyze-msg', `解析完了: ${data.name ?? '不明'} / ${data.brand ?? '不明'} / ${data.spirit_type ?? '不明'}`, 'ok');
+  }
+
+  async function registerBottle() {
+    const body = {
+      nfc_uid:      document.getElementById('reg-nfc-uid').value,
+      guest_name:   document.getElementById('reg-guest-name').value,
+      drink_name:   document.getElementById('reg-drink-name').value,
+      expires_days: parseInt(document.getElementById('reg-expires-days').value),
+      email:        document.getElementById('reg-email').value || null,
+    };
+    const res = await fetch(`${API}/staff/bottles`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) { msg('register-msg', data.error, 'err'); return; }
+    msg('register-msg', `登録完了！ ID: ${data.id}`, 'ok');
+    loadBottles();
+  }
+
+  async function loadBottles() {
+    const res = await fetch(`${API}/staff/bottles`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const bottles = await res.json();
+    const list = document.getElementById('bottles-list');
+    if (!bottles.length) { list.innerHTML = '<p style="color:#888">ボトルがありません</p>'; return; }
+
+    list.innerHTML = bottles.map(b => `
+      <div class="bottle-card">
+        <h3>${b.drink_name ?? '不明'}</h3>
+        <p>お客さん: ${b.guest_name ?? '不明'} / NFC: ${b.nfc_uid}</p>
+        <div class="remaining-bar"><div class="remaining-fill" style="width:${b.remaining_percent}%"></div></div>
+        <p>残量: ${b.remaining_percent}%</p>
+        <input type="range" min="0" max="100" value="${b.remaining_percent}" id="range-${b.id}" style="width:100%;margin-bottom:8px;">
+        <button class="btn-success" onclick="updateBottle(${b.id})">残量を更新</button>
+      </div>
+    `).join('');
+  }
+
+  async function updateBottle(id) {
+    const pct = parseInt(document.getElementById(`range-${id}`).value);
+    const res = await fetch(`${API}/staff/bottles/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ remaining_percent: pct }),
+    });
+    if (res.ok) loadBottles();
+  }
+</script>
+</body>
+</html>

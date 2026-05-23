@@ -459,6 +459,63 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /staff/bottles/analyze-image:
+    post:
+      tags: [staff]
+      summary: ボトル画像をAIで解析して銘柄を自動入力
+      description: |
+        カメラで撮影したボトルの画像をbase64で送ると、Claude AIがラベルを読み取って
+        銘柄・ブランド・種類を返す。ボトル登録フォームの自動入力に使う。
+        環境変数 `ANTHROPIC_API_KEY` が必要。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image, media_type]
+              properties:
+                image:
+                  type: string
+                  description: base64エンコードされた画像データ
+                media_type:
+                  type: string
+                  description: 画像のMIMEタイプ
+                  enum: [image/jpeg, image/png, image/webp]
+            example:
+              image: "/9j/4AAQSkZJRgAB..."
+              media_type: "image/jpeg"
+      responses:
+        "200":
+          description: 解析結果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    nullable: true
+                    description: 商品名（例：山崎12年）
+                  brand:
+                    type: string
+                    nullable: true
+                    description: ブランド名（例：サントリー）
+                  spirit_type:
+                    type: string
+                    nullable: true
+                    description: 種類（例：ウイスキー）
+              example:
+                name: "山崎12年"
+                brand: "サントリー"
+                spirit_type: "ウイスキー"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /staff/bottles/{id}:
     patch:
       tags: [staff]

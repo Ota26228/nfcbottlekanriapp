@@ -895,3 +895,90 @@ pub async fn handler_link_bottle(
 
     Ok(Json(item))
 }
+
+// ════════════════════════════════════════════════════════════
+// ハンドラー — AI画像解析
+// ════════════════════════════════════════════════════════════
+
+// POST /v1/staff/bottles/analyze-image
+#[derive(Deserialize)]
+pub struct AnalyzeImageRequest {
+    pub image:      String, // base64エンコードされた画像
+    pub media_type: String, // "image/jpeg" or "image/png"
+}
+
+#[derive(Serialize)]
+pub struct AnalyzeImageResponse {
+    pub name:        Option<String>,
+    pub brand:       Option<String>,
+    pub spirit_type: Option<String>,
+}
+
+pub async fn handler_analyze_bottle_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AnalyzeImageRequest>,
+) -> ApiResult<AnalyzeImageResponse> {
+    let _shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| ApiError::Internal("ANTHROPIC_API_KEY が設定されていません".into()))?;
+
+    let request_body = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 256,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": body.media_type,
+                        "data": body.image
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "このボトルのラベルを読んで、以下のJSON形式のみで答えてください:\n{\"name\":\"商品名\",\"brand\":\"ブランド名\",\"spirit_type\":\"種類（ウイスキー、焼酎、ワインなど）\"}\n不明な項目はnullにしてください。JSONのみ返してください。"
+                }
+            ]
+        }]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let resp_json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let text = resp_json["content"][0]["text"]
+        .as_str()
+        .ok_or_else(|| ApiError::Internal("Claude APIの応答が不正です".into()))?;
+
+    // マークダウンのコードブロックを除去
+    let text = text.trim();
+    let text = text.strip_prefix("```json").unwrap_or(text);
+    let text = text.strip_prefix("```").unwrap_or(text);
+    let text = text.strip_suffix("```").unwrap_or(text);
+    let text = text.trim();
+
+    let parsed: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| ApiError::Internal(format!("パース失敗: {} / レスポンス: {}", e, text)))?;
+
+    Ok(Json(AnalyzeImageResponse {
+        name:        parsed["name"].as_str().map(String::from),
+        brand:       parsed["brand"].as_str().map(String::from),
+        spirit_type: parsed["spirit_type"].as_str().map(String::from),
+    }))
+}
