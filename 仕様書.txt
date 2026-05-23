@@ -1,17 +1,31 @@
 ===============================================================
   ボトルキープ管理システム 仕様書
   プロジェクト名: bottlekanri
-  更新日: 2026-05-22
-  技術スタック: Rust / Axum / Leptos (WASM) / SQLite / Web NFC API
+  更新日: 2026-05-23
+  技術スタック: Rust / Axum / SQLite（バックエンド）
+               React Native / Expo（モバイルフロントエンド）
 ===============================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+0. 開発体制
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  担当              | 技術領域
+  ─────────────────────────────────────────────────
+  自分（バックエンド）| Rust / Axum / SQLite / REST API
+  i（フロントエンド）| React Native / Expo / NFC
+
+  ※ フロント・バックエンドは完全分離。
+    バックエンドは REST JSON API を公開するだけ。
+    フロントはそのAPIを叩くだけ。
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. システム概要
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 飲食店向けのボトルキープ管理システム。
-実際の顧客（飲食店オーナー・お客さん）に実際に使ってもらうことを
-最終目標とする。ハッカソン出展はその第一歩。
+iOS / Android ネイティブアプリとして提供する。
 
 【コア設計思想】
 NFCタグのハードウェアUID（タグ固有のシリアル番号）を
@@ -22,34 +36,40 @@ NFCタグのハードウェアUID（タグ固有のシリアル番号）を
   - ポータルNFCだけ店舗固有URLを書き込む（1店舗1枚）
 
 【用語定義】
-  NFC UID   : タグのハードウェア固有番号（例: 04:A3:2B:11:FF:C2）
-              変更・上書き不可。スマホのNFC機能で読み取れる。
-  ポータルNFC: お店の入口や卓上に置く「玄関タグ」。
-              /my-bottles へのURLが書き込まれている。
-  ボトルNFC  : 実際のボトルに取り付けるタグ。
-              何も書かない。UID読み取りのみ利用。
-  Web NFC API: Android版Chromeに搭載されているブラウザ機能。
-              ブラウザからNFCタグのUIDを直接読み取れる。
-  パスキー   : WebAuthn/FIDO2に基づく生体認証。
-              顔認証・指紋でログイン。パスワード不要。
+  NFC UID      : タグのハードウェア固有番号（例: 04:A3:2B:11:FF:C2）
+                 変更・上書き不可。スマホのNFC機能で読み取れる。
+  ポータルNFC  : お店の入口や卓上に置く「玄関タグ」。
+                 ディープリンク（bottlekeep://shop/1など）が書き込まれている。
+  ボトルNFC    : 実際のボトルに取り付けるタグ。
+                 何も書かない。UID読み取りのみ利用。
+  パスキー     : WebAuthn/FIDO2に基づく生体認証。
+                 顔認証・指紋でログイン。パスワード不要。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-2. リリース戦略（2フェーズ）
+2. アーキテクチャ全体像
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  Phase 1: ハッカソン出展版（Webアプリ）
-    対象端末  : Android Chrome
-    NFC方式   : Web NFC API（ブラウザ直接）
-    フロント  : Leptos (WASM)
-    認証      : パスキー（主）+ マジックリンク（フォールバック）
-    優先実装  : コア機能のデモが動くこと
+  [スマホ（iOS / Android）]
+      React Native + Expo
+          ↕ HTTPS REST API（JSON）
+  [サーバー]
+      Rust + Axum
+          ↕ SQL
+      SQLite（bottles.db）
 
-  Phase 2: 本番リリース版（ネイティブアプリ追加）
-    対象端末  : iOS + Android
-    NFC方式   : React Native（react-native-nfc-manager）
-    バックエンド: Phase 1のAxum APIをそのまま流用 ← 変更不要
-    追加実装  : AppStore/Play Store申請、Push通知
-    ※ バックエンドを変えずにフロントだけ追加する設計
+  【フロントエンドが持つもの】
+    - 全画面UI
+    - NFCスキャン（react-native-nfc-manager）
+    - パスキー認証UI（react-native-passkeys or webauthn）
+    - API呼び出しロジック
+    - ローカル状態管理
+
+  【バックエンドが持つもの】
+    - REST APIエンドポイント（Axum）
+    - 認証ロジック（パスキー / マジックリンク / スタッフPIN）
+    - DB操作（SQLite + sqlx）
+    - メール送信（magiclinkトークン）
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 3. 登場人物（Actor）
@@ -58,34 +78,49 @@ NFCタグのハードウェアUID（タグ固有のシリアル番号）を
   [店員]
     - お店のスタッフ
     - 管理画面でボトルの新規登録・残量更新・期限確認を行う
-    - 店舗PINコードで /admin にログイン
-    - 操作端末: Android Chrome（Phase 1）/ 任意（Phase 2）
+    - 店舗PINコードでログイン
+    - 操作端末: iOS / Android どちらでも
 
   [お客さん]
     - キープボトルを持つ常連客
     - パスキー（顔認証・指紋）でログイン
     - ポータルNFCタップ → ログイン → 一度だけボトルNFCをタッチ
     - 次回以降はアプリを開くだけでマイボトル一覧が見える
-    - 操作端末: Android Chrome（Phase 1）/ iOS + Android（Phase 2）
+    - 操作端末: iOS / Android どちらでも
 
   [システム管理者]
     - 新規店舗のセットアップ
     - ハッカソンスコープでは開発者が直接DBに投入で代替
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 4. NFCタグの種類と設定
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   [ポータルNFC]  （各店1〜数枚）
-    書き込み内容: https://yourapp.com/my-bottles
+    書き込み内容: ディープリンク（例: bottlekeep://shop/1）
+                  またはユニバーサルリンク（https://bottlekeep.app/shop/1）
     設置場所    : 卓上、カウンター、入口の目立つ場所
-    役割        : お客さんがアプリに入るための玄関口
+    役割        : アプリを起動してシop画面に誘導する玄関口
 
   [ボトルNFC]    （店の在庫分、大量）
     書き込み内容: 何も書かない ← ここが最大の特徴
     取り付け方  : ボトルの首にかける or ラベル下に貼る
     役割        : UID = ボトルの"名札"
                   箱から出してそのまま使える。事前作業ゼロ。
+
+  【iOS でのNFC読み取り】
+    - react-native-nfc-manager を使用
+    - Core NFC（NDEF + ISO 15693 Tag）で UID 読み取り可能
+    - Background Tag Reading は iOS 13+で対応
+    - Info.plist に NFCReaderUsageDescription が必要
+    - Entitlement に com.apple.developer.nfc.readersession.formats が必要
+
+  【Android でのNFC読み取り】
+    - react-native-nfc-manager を使用
+    - Foreground Dispatch で UID 読み取り
+    - AndroidManifest.xml に NFC パーミッション追加
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 5. ユーザーフロー
@@ -95,46 +130,48 @@ NFCタグのハードウェアUID（タグ固有のシリアル番号）を
 5-1. 店員: 新規ボトル登録フロー
 ─────────────────────────────────
 
-  1. /admin を開く → PINコードを入力（店舗ごとに異なる）
-  2. 「新規ボトル登録」ボタンをタップ → 登録モード開始
-  3. 画面全体がパルスアニメーション「タグをかざして」
-     → 内部でWeb NFC APIが scan() を開始
+  1. アプリを開く → PINコードを入力（店舗ごとに異なる）
+  2. 「新規ボトル登録」タブを開く
+  3. 「NFCタグをスキャン」ボタンをタップ
+     → react-native-nfc-manager が scan() を開始
   4. ボトルのNFCタグを端末にかざす → UID取得
   5. 登録フォームが表示:
        - お客様名（例: 田中様）
        - お酒の銘柄（例: 山崎12年）
        - キープ期限（デフォルト: 3ヶ月後）
-  6. 「登録」ボタン → DBに保存 → 「登録完了」
+       - メールアドレス（任意・通知用）
+  6. 「登録」ボタン → APIに送信 → DBに保存 → 「登録完了」
 
 ─────────────────────────────────
 5-2. 店員: 日常運用（残量更新）
 ─────────────────────────────────
 
-  1. 管理画面でボトル一覧から選ぶ か、
+  1. 管理画面のボトル一覧から選ぶ か、
      ボトルのタグをかざす → ボトル情報が開く
-  2. 残量を更新 → 保存
+  2. 残量をスライダーで更新 → 保存
 
 ─────────────────────────────────
 5-3. お客さん: 初回登録フロー
 ─────────────────────────────────
 
-  1. 卓上のポータルNFCをタップ → /my-bottles が開く
+  1. 卓上のポータルNFCをかざす
+     → アプリが起動（未インストールならApp Store/Play Storeへ）
+     → ショップ画面が開く
   2. ログイン画面へ（未ログインの場合）
   3. パスキーで新規登録（メアド・ニックネームは任意）
      または メールリンクで登録（パスキー非対応端末）
-  4. /my-bottles に戻る
+  4. マイボトル画面に戻る
   5. 「ボトルを追加」→ 自分のボトルNFCをかざす
   6. 自動でマイボトルにリンク → 完了
 
-  ※ お客さんがやることはこれだけ。店員のメアド管理は不要。
+  ※ お客さんがやることはこれだけ。
 
 ─────────────────────────────────
 5-4. お客さん: 2回目以降
 ─────────────────────────────────
 
-  1. ホーム画面のアイコンをタップ（PWA）→ /my-bottles
-  2. パスキー（顔認証・指紋）→ 即ログイン
-  3. 全店舗のマイボトル一覧が表示
+  1. アプリを開く → パスキー（顔認証・指紋）→ 即ログイン
+  2. 全店舗のマイボトル一覧が表示
 
 ─────────────────────────────────
 5-5. お客さん: マイボトル一覧
@@ -151,23 +188,44 @@ NFCタグのハードウェアUID（タグ固有のシリアル番号）を
     ├────────────────────────────┤
     │ [クラブ新宿XYZ]             │
     │ チャミスル                  │
-    │ ██████████  60%             │
+    │ ██████░░░░  60%             │
     │ 期限: 2026-08-01 まで       │
     └────────────────────────────┘
 
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-6. 画面一覧（ルーティング）
+6. 画面一覧（React Native スクリーン）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  パス              | 概要                   | 利用者
-  ─────────────────────────────────────────────────────
-  /                 | ランディング            | 全員
-  /my-bottles       | マイボトル一覧（客ホーム）| お客さん（要ログイン）
-  /admin            | 店員管理画面（PIN認証）  | 店員
-  /auth/login       | ログイン・新規登録      | お客さん
-  /auth/verify      | マジックリンク処理      | お客さん
+  スクリーン名          | 概要                        | 利用者
+  ────────────────────────────────────────────────────────
+  LoginScreen           | ログイン・新規登録           | お客さん
+  MyBottlesScreen       | マイボトル一覧（客ホーム）   | お客さん（要ログイン）
+  BottleDetailScreen    | ボトル詳細・残量更新         | お客さん
+  ShopPortalScreen      | ポータルNFC起動時の画面      | お客さん
+  AdminPinScreen        | 店員PINログイン              | 店員
+  AdminDashboardScreen  | 管理ダッシュボード           | 店員
+  AdminRegisterScreen   | 新規ボトル登録               | 店員
+  AdminBottleListScreen | ボトル一覧（管理）           | 店員
+  VerifyScreen          | マジックリンク処理           | お客さん
 
-  ※ /shop/:shop_id は将来的に削除予定（現在は残存）
+  【ナビゲーション構造】
+    RootNavigator
+      ├── AuthStack（未ログイン）
+      │     ├── LoginScreen
+      │     └── VerifyScreen
+      └── AppTabs（ログイン済み）
+            ├── MyBottlesTab
+            │     ├── MyBottlesScreen
+            │     └── BottleDetailScreen
+            └── ShopPortalScreen（ディープリンク起動）
+
+    AdminStack（別フロー・PIN認証）
+      ├── AdminPinScreen
+      └── AdminDashboardScreen
+            ├── AdminRegisterScreen（タブ）
+            └── AdminBottleListScreen（タブ）
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 7. 認証設計
@@ -177,29 +235,34 @@ NFCタグのハードウェアUID（タグ固有のシリアル番号）を
 
   初回:
     A) パスキーで新規登録（推奨）
-       → メアド・ニックネームは任意（通知が欲しい場合のみ）
-       → 顔認証・指紋を登録 → セッション発行
-    B) マジックリンクで登録（パスキー非対応端末）
-       → メアドを入力 → リンクをタップ → セッション発行
+       → react-native-passkeys でデバイスの生体認証を登録
+       → サーバーのwebauthn-rsでチャレンジ検証
+       → JWTセッショントークン発行
+    B) マジックリンクで登録（フォールバック）
+       → メアドを入力 → メール送信 → リンクタップ → トークン発行
 
   2回目以降:
     パスキー登録済み → 顔認証・指紋 → 即ログイン
 
+  セッション管理:
+    - サーバーはJWTを発行（またはOpaque Token）
+    - React Native側は SecureStore（Expo）に保存
+    - API呼び出し時に Authorization: Bearer <token> で送る
+
   [スタッフの認証]
 
-  店舗PINコード（4〜6桁）を入力 → staff_session Cookie発行（7日間）
-  PINは shops テーブルで店舗ごとに管理。デフォルト: '1234'
+    店舗PINコード（4桁）を入力 → トークン発行（7日間）
+    PINは shops テーブルで店舗ごとに管理
 
-  将来（Phase 2）:
-    店舗オーナーがアカウント作成 → 店員をメール招待
-    → 店員がパスキー設定 → ロール（staff）でアクセス制御
+    将来:
+      店舗オーナーアカウント → 店員メール招待 → パスキー設定
 
   [セキュリティ方針]
-    - セッショントークン: httpOnly Cookie（XSS耐性）
+    - セッショントークン: SecureStore（キーチェーン/キーストア）
     - HTTPS必須（本番）
     - パスキー: WebAuthn Level 2（FIDO2準拠）
     - RP_ID: localhost（開発）/ 本番ドメイン（本番）
-    - LocalStorage: 認証情報は一切保存しない
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 8. DBスキーマ
@@ -218,35 +281,129 @@ NFCタグのハードウェアUID（タグ固有のシリアル番号）を
 
   staff_sessions (token, shop_id, expires_at)
 
+  ※ スキーマはPhase 1（Leptos版）から変更なし。
+    バックエンドはそのまま流用できる。
+
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-9. APIエンドポイント（サーバー関数）
+9. REST API エンドポイント
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  [お客さん認証]
-  request_magic_link(email)         マジックリンク送信
-  verify_magic_link(token)          トークン検証・ログイン
-  passkey_discoverable_start()      パスキーログイン開始
-  passkey_discoverable_finish(...)  パスキーログイン完了
-  passkey_first_reg_start(...)      パスキー新規登録開始
-  passkey_first_reg_finish(...)     パスキー新規登録完了
-  get_current_customer()            セッション確認
-  logout()                          ログアウト
+  ベースURL: https://api.bottlekeep.app/v1（本番）
+             http://localhost:3000/v1（開発）
 
-  [スタッフ認証]
-  staff_login(pin)                  PINログイン・セッション発行
-  get_staff_session()               スタッフセッション確認
-  staff_logout()                    スタッフログアウト
+  ─────────────────────────────────────────
+  認証（お客さん）
+  ─────────────────────────────────────────
 
-  [ボトル管理]
-  register_bottle(...)              新規ボトル登録（店員）
-  get_shop_bottles(shop_id)         店舗ボトル一覧（店員）
-  get_my_bottles()                  マイボトル一覧（お客さん）
-  link_bottle(nfc_uid)              ボトルをマイボトルに追加
-  check_nfc_tag(nfc_uid)            NFC UID照合
+  POST   /auth/passkey/register/start
+    body: { email?: string, display_name?: string }
+    res:  { uuid: string, challenge_json: string }
 
-  [その他]
-  nfc_scan()                        Web NFC API呼び出し（WASM）
-  get_shop(shop_id)                 店舗情報取得
+  POST   /auth/passkey/register/finish
+    body: { uuid: string, credential: object }
+    res:  { token: string, customer: Customer }
+
+  POST   /auth/passkey/login/start
+    res:  { session_id: string, challenge_json: string }
+
+  POST   /auth/passkey/login/finish
+    body: { session_id: string, credential: object }
+    res:  { token: string, customer: Customer }
+
+  POST   /auth/magic-link/send
+    body: { email: string }
+    res:  { ok: true }
+
+  POST   /auth/magic-link/verify
+    body: { token: string }
+    res:  { token: string, customer: Customer }
+
+  GET    /auth/me
+    header: Authorization: Bearer <token>
+    res:  { customer: Customer }
+
+  POST   /auth/logout
+    header: Authorization: Bearer <token>
+    res:  { ok: true }
+
+  ─────────────────────────────────────────
+  認証（スタッフ）
+  ─────────────────────────────────────────
+
+  POST   /staff/login
+    body: { shop_id: int, pin: string }
+    res:  { token: string, shop: Shop }
+
+  GET    /staff/me
+    header: Authorization: Bearer <token>
+    res:  { shop: Shop }
+
+  POST   /staff/logout
+    header: Authorization: Bearer <token>
+    res:  { ok: true }
+
+  ─────────────────────────────────────────
+  ボトル管理（店員）
+  ─────────────────────────────────────────
+
+  POST   /staff/bottles
+    header: Authorization: Bearer <staff_token>
+    body:
+      { nfc_uid, guest_name, drink_name, kept_at, expires_at, email? }
+    res:  { bottle: Bottle }
+
+  GET    /staff/bottles?shop_id=1
+    header: Authorization: Bearer <staff_token>
+    res:  { bottles: [Bottle] }
+
+  PATCH  /staff/bottles/:id
+    header: Authorization: Bearer <staff_token>
+    body:  { remaining_percent?: int, expires_at?: string, ... }
+    res:  { bottle: Bottle }
+
+  DELETE /staff/bottles/:id
+    header: Authorization: Bearer <staff_token>
+    res:  { ok: true }
+
+  ─────────────────────────────────────────
+  マイボトル（お客さん）
+  ─────────────────────────────────────────
+
+  GET    /customer/bottles
+    header: Authorization: Bearer <token>
+    res:  { bottles: [MyBottleItem] }
+
+  POST   /customer/bottles/link
+    header: Authorization: Bearer <token>
+    body:  { nfc_uid: string }
+    res:  { bottle: MyBottleItem }
+
+  ─────────────────────────────────────────
+  ショップ
+  ─────────────────────────────────────────
+
+  GET    /shops/:shop_id
+    res:  { shop: Shop }
+
+  ─────────────────────────────────────────
+  レスポンス型
+  ─────────────────────────────────────────
+
+  Customer:
+    { id, uuid, email?, display_name?, created_at }
+
+  Shop:
+    { id, name }
+
+  Bottle:
+    { id, shop_id, nfc_uid, guest_name, drink_name,
+      remaining_percent, kept_at, expires_at, email? }
+
+  MyBottleItem:
+    { id, shop_name, drink_name?, remaining_percent,
+      kept_at, expires_at, linked_at }
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 10. UIデザイン原則（酔っ払いでも使えるUI）
@@ -269,66 +426,133 @@ NFCタグのハードウェアUID（タグ固有のシリアル番号）を
     エラー    : #FF9FAA（レッド）
     テキスト  : #F0EAE0（オフホワイト）
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-11. 技術仕様
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-  Phase 1（ハッカソン）:
-    バックエンド  : Rust + Axum
-    フロントエンド: Rust + Leptos 0.8 (WASM)
-    DB          : SQLite (sqlx)
-    NFC         : Web NFC API（Android Chrome専用）
-    認証        : パスキー（webauthn-rs）+ マジックリンク
-    CSS         : Tailwind CSS v4 + cargo-leptos
-    PWA         : manifest.json（start_url: /my-bottles）
-
-  Phase 2（本番）:
-    上記バックエンドはそのまま。フロントだけ追加:
-    モバイルアプリ: React Native + react-native-nfc-manager
-    iOS NFC     : Core NFC（React Native経由）
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-12. 制約事項・注意点
+11. 技術スタック
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  ⚠️  Phase 1: iOS（iPhone/iPad）はNFC操作不可
-      → Phase 2でReact Nativeアプリを作って対応
+  【バックエンド（自分担当）】
+    言語          : Rust
+    Webフレームワーク: Axum 0.8
+    DB            : SQLite（sqlx）
+    認証          : webauthn-rs（パスキー）、lettre（メール）
+    セッション    : JWT or Opaque Token（HTTPヘッダーで受け渡し）
+    デプロイ      : VPS or fly.io（TBD）
 
-  ⚠️  Web NFC APIはHTTPS必須（+ localhost）
-      本番デプロイ時はSSL証明書が必要（Let's Encrypt推奨）
+  【フロントエンド（i 担当）】
+    フレームワーク: React Native + Expo（managed workflow）
+    NFC           : react-native-nfc-manager
+    パスキー      : react-native-passkeys（or Expo WebBrowser + FIDO）
+    状態管理      : Zustand or Jotai（TBD）
+    ナビゲーション: React Navigation v6
+    セキュアストレージ: expo-secure-store
+    HTTPクライアント : axios or fetch
 
-  ⚠️  パスキーもHTTPS必須
-      開発時は http://localhost:3000 でアクセスすること
-      http://127.0.0.1:3000 ではパスキーが動作しない
+  【対応OS】
+    iOS           : 14以上（NFC Background Reading は13+）
+    Android       : API 24以上（Android 7.0+）
 
-  ⚠️  メール送信サーバー
-      マジックリンク認証にSMTP設定が必要
-      環境変数: SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM
+  【開発ツール】
+    API仕様共有   : この仕様書 or OpenAPI YAML（必要に応じて）
+    ローカル開発  : バックエンドを localhost:3000 で起動
+                    フロントは Expo Go or ビルドして実機接続
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-13. 開発優先順位（ハッカソン向け）
+12. バックエンド改修方針（Leptos → REST API）
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  実装済み ✅:
-    [x] パスキー登録・ログイン（discoverable credential）
-    [x] マジックリンク認証（フォールバック）
-    [x] スタッフPIN認証（shop別・7日間セッション）
-    [x] 店員: NFCスキャン → ボトル登録
-    [x] お客さん: NFCタッチ → マイボトルに自動リンク
-    [x] マイボトル一覧（全店舗横断）
-    [x] PWA（manifest.json・start_url=/my-bottles）
-    [x] レスポンシブUI（スマホ＋デスクトップ）
+  現状:
+    Leptos の #[server] マクロでサーバー関数として実装。
+    POST /api/<function_name> というエンドポイントが自動生成される。
+    フロントもRustなので型共有ができていた。
 
-  残タスク:
-    [ ] 残量更新UI（スライダーで更新→保存）
-    [ ] キープ期限アラート表示
-    [ ] /shop/:shop_id の削除 or /my-bottles へのリダイレクト化
-    [ ] 登録完了メール通知（ボトル登録時にお客さんへ）
+  変更後:
+    React Native からは通常のHTTP/JSONリクエストを投げる。
+    Leptosのサーバー関数をAxumのRouterに直接書き直す。
 
-  Phase 2（ハッカソン後）:
-    [ ] React Nativeアプリ（iOS完全対応）
+  移植方針:
+    ① lib.rs の #[server] 関数をそのまま axum::Router に移す
+       - ロジックは使い回せる
+       - 引数/戻り値をJSONで受け渡す形に変更
+    ② Leptos の ServerFnError → axum::Json + StatusCode に変更
+    ③ Cookieベースのセッション → Bearerトークンに変更
+    ④ app.rs（フロント）は削除 or 別ブランチに退避
+       Cargo.tomlから hydrate / Leptos 依存を除去
+
+  スコープ外（削除）:
+    - Leptos / WASM 関連（leptos, leptos_axum, leptos_router等）
+    - Web NFC呼び出し（nfc_bridge.js）→ アプリ側の責務
+    - passkey_bridge.js → アプリ側の責務
+    - PWA（manifest.json）
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+13. 制約事項・注意点
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ⚠️  iOS NFC
+      - バックグラウンドNFC読み取り（タグをかざすだけ）はiOS 14+
+      - アプリがフォアグラウンドのとき限定 or Background Tag Reading
+      - provisioning profile に NFC entitlement が必要（実機ビルド必須）
+
+  ⚠️  パスキー + React Native
+      - Expo managed workflow では制約あり → bare workflow または
+        development build（eas build）が必要な場合がある
+      - RP_ID（relying party）はドメインと紐づく
+        開発中は localhost 用の設定が必要
+
+  ⚠️  HTTPS必須
+      - 本番APIはSSL必須
+      - 開発時はAndroid実機からlocalhostに接続するための
+        ネットワーク設定（Expo の host または ngrok）が必要
+
+  ⚠️  App Store 審査
+      - NFCはentitlementが必要→審査で確認されることがある
+      - 使用目的を明確に記載すること
+
+  ⚠️  メール送信
+      - マジックリンク認証にSMTP設定が必要
+      - 環境変数: SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+14. 開発優先順位・タスク
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  【バックエンド（自分）】
+
+  優先度 高（フロントが開発を始めるために必要）:
+    [ ] Leptosを除去 → Axum単体のREST APIサーバーに改修
+    [ ] /v1/auth/* エンドポイント実装（パスキー / マジックリンク）
+    [ ] /v1/staff/* エンドポイント実装（PIN認証 / ボトル登録）
+    [ ] /v1/customer/* エンドポイント実装（マイボトル）
+    [ ] CORS設定（Expoのdevサーバーから叩けるように）
+    [ ] Bearerトークン認証ミドルウェア
+
+  優先度 中:
+    [ ] /v1/shops/:id エンドポイント
+    [ ] 残量更新エンドポイント
+    [ ] 登録完了メール通知
+    [ ] OpenAPI yamlの生成（i に渡す）
+
+  優先度 低（後で）:
     [ ] Push通知（期限切れアラート）
     [ ] スタッフ個別アカウント（招待フロー）
-    [ ] AppStore / Play Store 申請
+    [ ] レート制限 / セキュリティヘッダー
+
+  【フロントエンド（i）】
+
+  優先度 高:
+    [ ] Expo プロジェクト作成・ナビゲーション構成
+    [ ] LoginScreen（パスキー / マジックリンク）
+    [ ] MyBottlesScreen（一覧表示）
+    [ ] AdminPinScreen + AdminDashboardScreen
+    [ ] NFCスキャン統合（react-native-nfc-manager）
+
+  優先度 中:
+    [ ] ShopPortalScreen（ディープリンク対応）
+    [ ] BottleDetailScreen（残量更新スライダー）
+    [ ] アニメーション（NFC読み取り中のリングアニメ等）
 
 ===============================================================

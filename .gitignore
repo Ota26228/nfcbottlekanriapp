@@ -12,3 +12,11 @@ Cargo.lock
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# データベース
+*.db
+*.db-shm
+*.db-wal
+
+# 環境変数
+.env

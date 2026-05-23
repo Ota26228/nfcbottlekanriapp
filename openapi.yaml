@@ -1,0 +1,715 @@
+openapi: 3.0.3
+info:
+  title: ボトルキープ管理 API
+  description: |
+    ボトルキープ管理システムのREST API仕様書。
+
+    ## 認証について
+    ログイン後に返ってくる `token` を、以降のリクエストのヘッダーに付ける。
+    ```
+    Authorization: Bearer <token>
+    ```
+
+    ## トークンの種類
+    - **顧客トークン** — `/v1/auth/*` のログインで取得。有効期限30日。
+    - **スタッフトークン** — `/v1/staff/login` で取得。有効期限7日。
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:3000/v1
+    description: 開発環境
+  - url: https://api.bottlekeep.app/v1
+    description: 本番環境（予定）
+
+tags:
+  - name: shops
+    description: 店舗情報
+  - name: auth
+    description: 顧客認証（パスキー・マジックリンク）
+  - name: staff
+    description: スタッフ認証・ボトル管理
+  - name: customer
+    description: 顧客のマイボトル
+
+# ════════════════════════════════════════════════════════════
+paths:
+
+  # ─── 店舗 ────────────────────────────────────────────────
+
+  /shops/{shop_id}:
+    get:
+      tags: [shops]
+      summary: 店舗情報を取得
+      description: 認証不要。ポータルNFCタップ後に店舗名を表示するために使う。
+      parameters:
+        - name: shop_id
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 1
+      responses:
+        "200":
+          description: 店舗情報
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Shop"
+              example:
+                id: 1
+                name: "BAR LUMEN"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ─── 顧客認証: マジックリンク ────────────────────────────
+
+  /auth/magic-link/send:
+    post:
+      tags: [auth]
+      summary: マジックリンクをメール送信
+      description: |
+        入力されたメールアドレスにログイン用リンクを送る。
+        リンクの有効期限は15分。
+        開発環境ではメールを送らずサーバーのログに出力する。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+            example:
+              email: "user@example.com"
+      responses:
+        "204":
+          description: 送信成功（レスポンスボディなし）
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /auth/magic-link/verify:
+    post:
+      tags: [auth]
+      summary: マジックリンクのトークンを検証してログイン
+      description: |
+        メール内のリンクからトークンを取り出してこのAPIに送る。
+        新規ユーザーの場合は自動でアカウントを作成する。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+            example:
+              token: "550e8400-e29b-41d4-a716-446655440000"
+      responses:
+        "200":
+          description: ログイン成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  # ─── 顧客認証: パスキー ──────────────────────────────────
+
+  /auth/passkey/register/start:
+    post:
+      tags: [auth]
+      summary: パスキー新規登録 ① チャレンジ取得
+      description: |
+        新規ユーザーのパスキー登録を開始する。
+        メール・ニックネームは任意。返ってきた `challenge_json` を
+        `react-native-passkeys` の登録APIに渡す。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                  format: email
+                  nullable: true
+                display_name:
+                  type: string
+                  nullable: true
+            example:
+              email: "user@example.com"
+              display_name: "田中"
+      responses:
+        "200":
+          description: チャレンジ情報
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uuid:
+                    type: string
+                    description: 次のステップで使うユーザーID
+                  challenge_json:
+                    type: string
+                    description: パスキーAPIに渡すチャレンジ（JSON文字列）
+
+  /auth/passkey/register/finish:
+    post:
+      tags: [auth]
+      summary: パスキー新規登録 ② 登録完了
+      description: |
+        `react-native-passkeys` の登録結果をサーバーに送って登録を完了する。
+        成功するとトークンが発行されてそのままログイン状態になる。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [uuid, credential]
+              properties:
+                uuid:
+                  type: string
+                  description: register/start で受け取ったUUID
+                credential:
+                  type: object
+                  description: react-native-passkeys の登録結果をそのまま渡す
+      responses:
+        "200":
+          description: 登録・ログイン成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /auth/passkey/login/start:
+    post:
+      tags: [auth]
+      summary: パスキーログイン ① チャレンジ取得
+      description: |
+        パスキーによるログインを開始する。
+        返ってきた `challenge_json` を `react-native-passkeys` の認証APIに渡す。
+      responses:
+        "200":
+          description: チャレンジ情報
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id:
+                    type: string
+                    description: 次のステップで使うセッションID
+                  challenge_json:
+                    type: string
+                    description: パスキーAPIに渡すチャレンジ（JSON文字列）
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /auth/passkey/login/finish:
+    post:
+      tags: [auth]
+      summary: パスキーログイン ② 認証完了
+      description: |
+        `react-native-passkeys` の認証結果をサーバーに送ってログインを完了する。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, credential]
+              properties:
+                session_id:
+                  type: string
+                  description: login/start で受け取ったセッションID
+                credential:
+                  type: object
+                  description: react-native-passkeys の認証結果をそのまま渡す
+      responses:
+        "200":
+          description: ログイン成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ─── 顧客: 共通 ──────────────────────────────────────────
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: ログイン中の顧客情報を取得
+      description: アプリ起動時にトークンが有効かどうかの確認に使う。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 顧客情報
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: ログアウト
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: ログアウト成功（レスポンスボディなし）
+
+  /auth/profile:
+    patch:
+      tags: [auth]
+      summary: プロフィール更新
+      description: ニックネームまたはメールアドレスを更新する。省略したフィールドは変更しない。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name:
+                  type: string
+                  nullable: true
+                email:
+                  type: string
+                  format: email
+                  nullable: true
+            example:
+              display_name: "田中"
+              email: "tanaka@example.com"
+      responses:
+        "200":
+          description: 更新後の顧客情報
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Customer"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ─── スタッフ: 認証 ──────────────────────────────────────
+
+  /staff/login:
+    post:
+      tags: [staff]
+      summary: スタッフPINログイン
+      description: |
+        店舗IDと4桁のPINでログインする。
+        成功するとスタッフトークンが返る（有効期限7日）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [shop_id, pin]
+              properties:
+                shop_id:
+                  type: integer
+                pin:
+                  type: string
+            example:
+              shop_id: 1
+              pin: "1234"
+      responses:
+        "200":
+          description: ログイン成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  shop:
+                    $ref: "#/components/schemas/Shop"
+              example:
+                token: "550e8400-e29b-41d4-a716-446655440000"
+                shop:
+                  id: 1
+                  name: "BAR LUMEN"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /staff/me:
+    get:
+      tags: [staff]
+      summary: ログイン中のスタッフ情報を取得
+      description: アプリ起動時にスタッフトークンが有効かどうかの確認に使う。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: スタッフ情報
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shop_id:
+                    type: integer
+                  shop_name:
+                    type: string
+              example:
+                shop_id: 1
+                shop_name: "BAR LUMEN"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /staff/logout:
+    post:
+      tags: [staff]
+      summary: スタッフログアウト
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: ログアウト成功（レスポンスボディなし）
+
+  # ─── スタッフ: ボトル管理 ────────────────────────────────
+
+  /staff/bottles:
+    get:
+      tags: [staff]
+      summary: 自店舗のボトル一覧を取得
+      description: ログイン中のスタッフの店舗に登録されている全ボトルを返す。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: ボトル一覧
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Bottle"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    post:
+      tags: [staff]
+      summary: 新規ボトルを登録
+      description: |
+        NFCタグのUIDとお客様情報を紐づけて登録する。
+        `expires_days` を省略すると90日後が期限になる。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nfc_uid, guest_name, drink_name]
+              properties:
+                nfc_uid:
+                  type: string
+                  description: NFCタグのハードウェアUID
+                guest_name:
+                  type: string
+                  description: お客様名
+                drink_name:
+                  type: string
+                  description: お酒の銘柄
+                expires_days:
+                  type: integer
+                  description: キープ期限（日数）。省略時は90日。
+                  nullable: true
+                email:
+                  type: string
+                  format: email
+                  description: お客様のメールアドレス（任意）
+                  nullable: true
+            example:
+              nfc_uid: "04:A3:2B:11:FF:C2"
+              guest_name: "田中様"
+              drink_name: "山崎12年"
+              expires_days: 90
+              email: "tanaka@example.com"
+      responses:
+        "200":
+          description: 登録されたボトル
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bottle"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /staff/bottles/{id}:
+    patch:
+      tags: [staff]
+      summary: ボトル情報を更新
+      description: |
+        残量・銘柄・期限を更新する。省略したフィールドは変更しない。
+        他の店舗のボトルは更新できない。
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                remaining_percent:
+                  type: integer
+                  minimum: 0
+                  maximum: 100
+                  nullable: true
+                drink_name:
+                  type: string
+                  nullable: true
+                expires_at:
+                  type: string
+                  format: date-time
+                  nullable: true
+            example:
+              remaining_percent: 60
+      responses:
+        "200":
+          description: 更新後のボトル
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Bottle"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ─── 顧客: マイボトル ────────────────────────────────────
+
+  /customer/bottles:
+    get:
+      tags: [customer]
+      summary: マイボトル一覧を取得
+      description: ログイン中の顧客に紐づいた全店舗のボトルを返す。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: マイボトル一覧
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MyBottleItem"
+              example:
+                - id: 1
+                  shop_name: "BAR LUMEN"
+                  nfc_uid: "04:A3:2B:11:FF:C2"
+                  drink_name: "山崎12年"
+                  remaining_percent: 80
+                  kept_at: "2026-05-01T12:00:00Z"
+                  expires_at: "2026-08-01T12:00:00Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /customer/bottles/link:
+    post:
+      tags: [customer]
+      summary: NFCタグをマイボトルに紐づける
+      description: |
+        お客様がボトルのNFCタグをかざしたときに呼ぶ。
+        スタッフが事前に登録済みのUIDでないと404が返る。
+        すでに紐づけ済みの場合は重複せず正常終了する。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nfc_uid]
+              properties:
+                nfc_uid:
+                  type: string
+            example:
+              nfc_uid: "04:A3:2B:11:FF:C2"
+      responses:
+        "200":
+          description: 紐づけ成功。追加されたボトル情報を返す。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MyBottleItem"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: このUIDは未登録（スタッフにお声がけください）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+# ════════════════════════════════════════════════════════════
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    Shop:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+      example:
+        id: 1
+        name: "BAR LUMEN"
+
+    Customer:
+      type: object
+      properties:
+        id:
+          type: integer
+        uuid:
+          type: string
+        email:
+          type: string
+          nullable: true
+        display_name:
+          type: string
+          nullable: true
+      example:
+        id: 1
+        uuid: "550e8400-e29b-41d4-a716-446655440000"
+        email: "user@example.com"
+        display_name: "田中"
+
+    AuthResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: 以降のリクエストに使うBearerトークン
+        customer:
+          $ref: "#/components/schemas/Customer"
+
+    Bottle:
+      type: object
+      properties:
+        id:
+          type: integer
+        shop_id:
+          type: integer
+        nfc_uid:
+          type: string
+        guest_name:
+          type: string
+          nullable: true
+        drink_name:
+          type: string
+          nullable: true
+        remaining_percent:
+          type: integer
+        kept_at:
+          type: string
+          format: date-time
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        email:
+          type: string
+          nullable: true
+
+    MyBottleItem:
+      type: object
+      properties:
+        id:
+          type: integer
+        shop_name:
+          type: string
+        nfc_uid:
+          type: string
+        drink_name:
+          type: string
+          nullable: true
+        remaining_percent:
+          type: integer
+        kept_at:
+          type: string
+          format: date-time
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      example:
+        error: "エラーメッセージ"
+
+  responses:
+    Unauthorized:
+      description: 認証エラー（トークンなし・期限切れ）
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "ログインが必要です"
+
+    NotFound:
+      description: リソースが見つからない
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "見つかりません"
+
+    BadRequest:
+      description: リクエストの内容が不正
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+    InternalError:
+      description: サーバー内部エラー
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

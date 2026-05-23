@@ -1,127 +1,112 @@
-pub mod app;
-
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use axum::{
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
-use leptos::prelude::*;
+use chrono::{DateTime, Duration, Utc};
+use sqlx::SqlitePool;
+use webauthn_rs::prelude::{Webauthn, PasskeyRegistration, PasskeyAuthentication};
 
-// ─── データ型定義 ────────────────────────────────────────────
+// ─── 共有状態 ──────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: SqlitePool,
+    pub webauthn: Arc<Webauthn>,
+    pub pending_regs:               Arc<Mutex<HashMap<String, PasskeyRegistration>>>,
+    pub pending_auths:              Arc<Mutex<HashMap<String, PasskeyAuthentication>>>,
+    pub pending_discoverable_auths: Arc<Mutex<HashMap<String, PasskeyAuthentication>>>,
+}
+
+// ─── エラー型 ──────────────────────────────────────────────────
+
+pub enum ApiError {
+    Unauthorized(String),
+    NotFound(String),
+    BadRequest(String),
+    Internal(String),
+}
+
+impl From<sqlx::Error> for ApiError {
+    fn from(e: sqlx::Error) -> Self {
+        ApiError::Internal(e.to_string())
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match self {
+            ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
+            ApiError::NotFound(m)     => (StatusCode::NOT_FOUND, m),
+            ApiError::BadRequest(m)   => (StatusCode::BAD_REQUEST, m),
+            ApiError::Internal(m)     => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        };
+        (status, Json(serde_json::json!({ "error": msg }))).into_response()
+    }
+}
+
+type ApiResult<T> = Result<Json<T>, ApiError>;
+
+// ─── データ型 ──────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Shop {
-    pub id: i32,
+    pub id:   i32,
     pub name: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
+#[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Bottle {
-    pub id: i32,
-    pub shop_id: i32,
-    pub nfc_uid: String,
-    pub guest_name: Option<String>,
-    pub drink_name: Option<String>,
+    pub id:                i32,
+    pub shop_id:           i32,
+    pub nfc_uid:           String,
+    pub guest_name:        Option<String>,
+    pub drink_name:        Option<String>,
     pub remaining_percent: i32,
-    pub kept_at: Option<DateTime<Utc>>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub email: Option<String>,
+    pub kept_at:           Option<DateTime<Utc>>,
+    pub expires_at:        Option<DateTime<Utc>>,
+    pub email:             Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum BottleCheckResult {
-    NotRegistered { nfc_uid: String },
-    Registered(Bottle),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
+#[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Customer {
-    pub id: i32,
-    pub uuid: String,
-    pub email: Option<String>,
+    pub id:           i32,
+    pub uuid:         String,
+    pub email:        Option<String>,
     pub display_name: Option<String>,
 }
 
-// マイボトル一覧用（複数店舗横断）
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "ssr", derive(sqlx::FromRow))]
+#[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MyBottleItem {
-    pub id: i32,
-    pub shop_name: String,
-    pub nfc_uid: String,
-    pub drink_name: Option<String>,
+    pub id:                i32,
+    pub shop_name:         String,
+    pub nfc_uid:           String,
+    pub drink_name:        Option<String>,
     pub remaining_percent: i32,
-    pub kept_at: Option<DateTime<Utc>>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub kept_at:           Option<DateTime<Utc>>,
+    pub expires_at:        Option<DateTime<Utc>>,
 }
 
-// ─── SSR専用: 状態管理 ───────────────────────────────────────
+// ─── 認証ヘルパー ──────────────────────────────────────────────
 
-#[cfg(feature = "ssr")]
-pub mod ssr {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-    use sqlx::SqlitePool;
-    use leptos::prelude::provide_context;
-    use webauthn_rs::prelude::{Webauthn, PasskeyRegistration, PasskeyAuthentication};
-
-    #[derive(Clone)]
-    pub struct WebauthnState {
-        pub webauthn: Arc<Webauthn>,
-        pub pending_regs:               Arc<Mutex<HashMap<String, PasskeyRegistration>>>,
-        pub pending_auths:              Arc<Mutex<HashMap<String, PasskeyAuthentication>>>,
-        pub pending_discoverable_auths: Arc<Mutex<HashMap<String, PasskeyAuthentication>>>,
-    }
-
-    pub fn register_db_pool(pool: SqlitePool) {
-        provide_context(pool);
-    }
-
-    pub fn register_webauthn(state: WebauthnState) {
-        provide_context(state);
-    }
-}
-
-// ─── SSR専用: ヘルパー ───────────────────────────────────────
-
-#[cfg(feature = "ssr")]
-async fn extract_session_token() -> Option<String> {
-    use axum::http::HeaderMap;
-    use leptos_axum::extract;
-
-    let headers = extract::<HeaderMap>().await.ok()?;
+fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     headers
-        .get(axum::http::header::COOKIE)
+        .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .map(|s| s.trim())
-        .find(|s| s.starts_with("session="))
-        .map(|s| s["session=".len()..].to_string())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
 }
 
-#[cfg(feature = "ssr")]
-async fn extract_staff_token() -> Option<String> {
-    use axum::http::HeaderMap;
-    use leptos_axum::extract;
-
-    let headers = extract::<HeaderMap>().await.ok()?;
-    headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .split(';')
-        .map(|s| s.trim())
-        .find(|s| s.starts_with("staff_session="))
-        .map(|s| s["staff_session=".len()..].to_string())
-}
-
-#[cfg(feature = "ssr")]
 async fn get_authenticated_customer(
-    pool: &sqlx::SqlitePool,
-) -> Result<Customer, ServerFnError> {
-    let token = extract_session_token().await
-        .ok_or_else(|| ServerFnError::new("ログインが必要です"))?;
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Result<Customer, ApiError> {
+    let token = extract_bearer(headers)
+        .ok_or_else(|| ApiError::Unauthorized("ログインが必要です".into()))?;
 
     sqlx::query_as::<_, Customer>(
         "SELECT c.id, c.uuid, c.email, c.display_name
@@ -132,12 +117,45 @@ async fn get_authenticated_customer(
     .bind(&token)
     .fetch_optional(pool)
     .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?
-    .ok_or_else(|| ServerFnError::new("セッションが無効です"))
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::Unauthorized("セッションが無効です".into()))
 }
 
-#[cfg(feature = "ssr")]
-async fn send_magic_link_email(to_email: &str, link: &str) -> Result<(), String> {
+async fn get_authenticated_staff(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+) -> Result<i32, ApiError> {
+    let token = extract_bearer(headers)
+        .ok_or_else(|| ApiError::Unauthorized("スタッフ認証が必要です".into()))?;
+
+    sqlx::query_scalar::<_, i32>(
+        "SELECT shop_id FROM staff_sessions WHERE token = ? AND expires_at > datetime('now')"
+    )
+    .bind(&token)
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::Unauthorized("スタッフセッションが無効です".into()))
+}
+
+async fn create_customer_session(pool: &SqlitePool, customer_id: i32) -> Result<String, ApiError> {
+    let token      = uuid::Uuid::new_v4().to_string();
+    let expires_at = Utc::now() + Duration::days(30);
+    sqlx::query(
+        "INSERT INTO customer_sessions (token, customer_id, expires_at) VALUES (?, ?, ?)"
+    )
+    .bind(&token)
+    .bind(customer_id)
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .map_err(ApiError::from)?;
+    Ok(token)
+}
+
+// ─── メール送信 ────────────────────────────────────────────────
+
+async fn send_magic_link_email(to_email: &str, link: &str) -> Result<(), ApiError> {
     use lettre::{
         transport::smtp::authentication::Credentials,
         AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
@@ -148,14 +166,10 @@ async fn send_magic_link_email(to_email: &str, link: &str) -> Result<(), String>
         link
     );
 
-    // SMTP_HOST が未設定の場合はコンソールに出力（開発・ハッカソン用）
     let smtp_host = match std::env::var("SMTP_HOST") {
         Ok(h) => h,
         Err(_) => {
-            leptos::logging::log!("=== Magic Link (dev mode) ===");
-            leptos::logging::log!("To: {}", to_email);
-            leptos::logging::log!("Link: {}", link);
-            leptos::logging::log!("==============================");
+            tracing::info!("=== Magic Link (dev mode) === To: {} | Link: {}", to_email, link);
             return Ok(());
         }
     };
@@ -168,216 +182,67 @@ async fn send_magic_link_email(to_email: &str, link: &str) -> Result<(), String>
         .unwrap_or_else(|_| "noreply@bottlekanri.app".to_string());
 
     let email = Message::builder()
-        .from(from_addr.parse().map_err(|e: lettre::address::AddressError| e.to_string())?)
-        .to(to_email.parse().map_err(|e: lettre::address::AddressError| e.to_string())?)
+        .from(from_addr.parse().map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
+        .to(to_email.parse().map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
         .subject("【ボトルキープ】ログインリンク")
         .body(body)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp_host)
-        .map_err(|e| e.to_string())?
+    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp_host)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
         .port(smtp_port)
         .credentials(Credentials::new(smtp_user, smtp_pass))
-        .build();
+        .build()
+        .send(email)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    mailer.send(email).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-// ─── WASMエントリポイント ─────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// ハンドラー — ショップ
+// ════════════════════════════════════════════════════════════
 
-#[cfg(feature = "hydrate")]
-#[wasm_bindgen::prelude::wasm_bindgen]
-pub fn hydrate() {
-    use crate::app::App;
-    console_error_panic_hook::set_once();
-    leptos::mount::hydrate_body(App);
-}
-
-// ─── クライアント専用: NFC読み取り ───────────────────────────
-
-#[cfg(feature = "hydrate")]
-pub async fn nfc_scan() -> Result<String, String> {
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen_futures::JsFuture;
-
-    let window = web_sys::window()
-        .ok_or_else(|| "windowが見つかりません".to_string())?;
-
-    let func = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("scanNfcTag"))
-        .map_err(|_| "nfc_bridge.jsが読み込まれていません".to_string())?
-        .dyn_into::<js_sys::Function>()
-        .map_err(|_| "scanNfcTagが関数ではありません".to_string())?;
-
-    let promise = func
-        .call0(&wasm_bindgen::JsValue::UNDEFINED)
-        .map_err(|e| e.as_string().unwrap_or("呼び出しエラー".into()))?
-        .dyn_into::<js_sys::Promise>()
-        .map_err(|_| "Promiseが返されませんでした".to_string())?;
-
-    JsFuture::from(promise)
-        .await
-        .map(|v| v.as_string().unwrap_or_default())
-        .map_err(|e| e.as_string().unwrap_or("NFCエラー".into()))
-}
-
-// ─── クライアント専用: パスキーJS呼び出し ────────────────────
-
-#[cfg(feature = "hydrate")]
-pub async fn passkey_call_js(fn_name: &str, arg: &str) -> Result<String, String> {
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen_futures::JsFuture;
-
-    let window = web_sys::window()
-        .ok_or_else(|| "windowが見つかりません".to_string())?;
-
-    let func = js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str(fn_name))
-        .map_err(|_| format!("passkey_bridge.jsが読み込まれていません ({fn_name})"))?
-        .dyn_into::<js_sys::Function>()
-        .map_err(|_| format!("{fn_name} が関数ではありません"))?;
-
-    let arg_val = wasm_bindgen::JsValue::from_str(arg);
-    let promise = func
-        .call1(&wasm_bindgen::JsValue::UNDEFINED, &arg_val)
-        .map_err(|e| e.as_string().unwrap_or("呼び出しエラー".into()))?
-        .dyn_into::<js_sys::Promise>()
-        .map_err(|_| "Promiseが返されませんでした".to_string())?;
-
-    JsFuture::from(promise)
-        .await
-        .map(|v| v.as_string().unwrap_or_default())
-        .map_err(|e| e.as_string().unwrap_or("パスキーエラー".into()))
-}
-
-// ─── サーバー関数: 既存 ───────────────────────────────────────
-
-#[server(CheckNfcTag, "/api")]
-pub async fn check_nfc_tag(nfc_uid: String) -> Result<BottleCheckResult, ServerFnError> {
-    use leptos::prelude::use_context;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DBプールが見つかりません"))?;
-
-    let result = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
-                kept_at, expires_at, email
-         FROM bottles WHERE nfc_uid = ?"
-    )
-    .bind(&nfc_uid)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    match result {
-        Some(bottle) if bottle.guest_name.is_some() => Ok(BottleCheckResult::Registered(bottle)),
-        _ => Ok(BottleCheckResult::NotRegistered { nfc_uid }),
-    }
-}
-
-#[server(RegisterBottle, "/api")]
-pub async fn register_bottle(
-    shop_id: i32,
-    nfc_uid: String,
-    guest_name: String,
-    drink_name: String,
-    expires_days: i32,
-) -> Result<Bottle, ServerFnError> {
-    use leptos::prelude::use_context;
-    use chrono::Duration;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DBプールが見つかりません"))?;
-
-    let now = Utc::now();
-    let expires_at = now + Duration::days(expires_days as i64);
-
-    let result = sqlx::query(
-        "INSERT INTO bottles (shop_id, nfc_uid, guest_name, drink_name,
-                              kept_at, expires_at, remaining_percent)
-         VALUES (?, ?, ?, ?, ?, ?, 100)"
-    )
-    .bind(shop_id)
-    .bind(&nfc_uid)
-    .bind(&guest_name)
-    .bind(&drink_name)
-    .bind(now)
-    .bind(expires_at)
-    .execute(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(format!("DB登録エラー: {}", e)))?;
-
-    let bottle = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
-                kept_at, expires_at, email
-         FROM bottles WHERE id = ?"
-    )
-    .bind(result.last_insert_rowid())
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    Ok(bottle)
-}
-
-#[server(GetShopBottles, "/api")]
-pub async fn get_shop_bottles(shop_id: i32) -> Result<Vec<Bottle>, ServerFnError> {
-    use leptos::prelude::use_context;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DBプールが見つかりません"))?;
-
-    let bottles = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
-                kept_at, expires_at, email
-         FROM bottles WHERE shop_id = ?
-         ORDER BY kept_at DESC"
-    )
-    .bind(shop_id)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    Ok(bottles)
-}
-
-#[server(GetShop, "/api")]
-pub async fn get_shop(shop_id: i32) -> Result<Shop, ServerFnError> {
-    use leptos::prelude::use_context;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DBプールが見つかりません"))?;
-
+// GET /v1/shops/:shop_id
+pub async fn handler_get_shop(
+    State(state): State<AppState>,
+    Path(shop_id): Path<i32>,
+) -> ApiResult<Shop> {
     let shop = sqlx::query_as::<_, Shop>("SELECT id, name FROM shops WHERE id = ?")
         .bind(shop_id)
-        .fetch_optional(&pool)
+        .fetch_optional(&state.pool)
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
-        .ok_or_else(|| ServerFnError::new("店舗が見つかりません"))?;
-
-    Ok(shop)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::NotFound("店舗が見つかりません".into()))?;
+    Ok(Json(shop))
 }
 
-// ─── サーバー関数: メール認証 ─────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// ハンドラー — 顧客認証
+// ════════════════════════════════════════════════════════════
 
-#[server(RequestMagicLink, "/api")]
-pub async fn request_magic_link(email: String) -> Result<(), ServerFnError> {
-    use leptos::prelude::use_context;
-    use chrono::Duration;
+// POST /v1/auth/magic-link/send
+#[derive(Deserialize)]
+pub struct MagicLinkSendRequest {
+    pub email: String,
+}
 
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
+pub async fn handler_request_magic_link(
+    State(state): State<AppState>,
+    Json(body): Json<MagicLinkSendRequest>,
+) -> Result<StatusCode, ApiError> {
+    let email = body.email.trim().to_lowercase();
 
-    // メールアドレスを小文字正規化
-    let email = email.trim().to_lowercase();
+    sqlx::query(
+        "DELETE FROM auth_magic_links WHERE email = ? OR expires_at < datetime('now')"
+    )
+    .bind(&email)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
 
-    // 古いリンクを削除
-    sqlx::query("DELETE FROM auth_magic_links WHERE email = ? OR expires_at < datetime('now')")
-        .bind(&email)
-        .execute(&pool)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let token = uuid::Uuid::new_v4().to_string();
+    let token      = uuid::Uuid::new_v4().to_string();
     let expires_at = Utc::now() + Duration::minutes(15);
 
     sqlx::query(
@@ -386,466 +251,173 @@ pub async fn request_magic_link(email: String) -> Result<(), ServerFnError> {
     .bind(&token)
     .bind(&email)
     .bind(expires_at)
-    .execute(&pool)
+    .execute(&state.pool)
     .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    .map_err(ApiError::from)?;
 
     let app_url = std::env::var("APP_URL")
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
     let link = format!("{}/auth/verify?token={}", app_url, token);
 
-    send_magic_link_email(&email, &link)
-        .await
-        .map_err(ServerFnError::new)?;
-
-    Ok(())
+    send_magic_link_email(&email, &link).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-#[server(VerifyMagicLink, "/api")]
-pub async fn verify_magic_link(token: String) -> Result<Customer, ServerFnError> {
-    use leptos::prelude::use_context;
-    use leptos_axum::ResponseOptions;
-    use chrono::Duration;
+// POST /v1/auth/magic-link/verify
+#[derive(Deserialize)]
+pub struct MagicLinkVerifyRequest {
+    pub token: String,
+}
 
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
+#[derive(Serialize)]
+pub struct AuthResponse {
+    pub token:    String,
+    pub customer: Customer,
+}
 
-    // トークン検証
+pub async fn handler_verify_magic_link(
+    State(state): State<AppState>,
+    Json(body): Json<MagicLinkVerifyRequest>,
+) -> ApiResult<AuthResponse> {
     let row = sqlx::query_as::<_, (String, String)>(
         "SELECT token, email FROM auth_magic_links
          WHERE token = ? AND used = 0 AND expires_at > datetime('now')"
     )
-    .bind(&token)
-    .fetch_optional(&pool)
+    .bind(&body.token)
+    .fetch_optional(&state.pool)
     .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?
-    .ok_or_else(|| ServerFnError::new("リンクが無効または期限切れです"))?;
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::BadRequest("リンクが無効または期限切れです".into()))?;
 
     let email = row.1;
 
-    // 使用済みにする
     sqlx::query("UPDATE auth_magic_links SET used = 1 WHERE token = ?")
-        .bind(&token)
-        .execute(&pool)
+        .bind(&body.token)
+        .execute(&state.pool)
         .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(ApiError::from)?;
 
-    // 顧客を取得または作成
     let customer = sqlx::query_as::<_, Customer>(
         "SELECT id, uuid, email, display_name FROM customers WHERE email = ?"
     )
     .bind(&email)
-    .fetch_optional(&pool)
+    .fetch_optional(&state.pool)
     .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    .map_err(ApiError::from)?;
 
-    let customer = if let Some(c) = customer {
-        c
-    } else {
-        let new_uuid = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO customers (uuid, email) VALUES (?, ?)")
-            .bind(&new_uuid)
-            .bind(&email)
-            .execute(&pool)
-            .await
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-        sqlx::query_as::<_, Customer>(
-            "SELECT id, uuid, email, display_name FROM customers WHERE email = ?"
-        )
-        .bind(&email)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
+    let customer = match customer {
+        Some(c) => c,
+        None => {
+            let new_uuid = uuid::Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO customers (uuid, email) VALUES (?, ?)")
+                .bind(&new_uuid).bind(&email)
+                .execute(&state.pool).await.map_err(ApiError::from)?;
+            sqlx::query_as::<_, Customer>(
+                "SELECT id, uuid, email, display_name FROM customers WHERE email = ?"
+            )
+            .bind(&email).fetch_one(&state.pool).await.map_err(ApiError::from)?
+        }
     };
 
-    // セッション作成
-    let session_token = uuid::Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + Duration::days(30);
-
-    sqlx::query(
-        "INSERT INTO customer_sessions (token, customer_id, expires_at) VALUES (?, ?, ?)"
-    )
-    .bind(&session_token)
-    .bind(customer.id)
-    .bind(expires_at)
-    .execute(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    // httpOnly Cookie をセット
-    let response_opts = use_context::<ResponseOptions>()
-        .ok_or_else(|| ServerFnError::new("ResponseOptions not found"))?;
-    let cookie = format!(
-        "session={session_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000"
-    );
-    response_opts.append_header(
-        axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_str(&cookie)
-            .map_err(|e| ServerFnError::new(e.to_string()))?,
-    );
-
-    Ok(customer)
+    let token = create_customer_session(&state.pool, customer.id).await?;
+    Ok(Json(AuthResponse { token, customer }))
 }
 
-#[server(GetCurrentCustomer, "/api")]
-pub async fn get_current_customer() -> Result<Option<Customer>, ServerFnError> {
-    use leptos::prelude::use_context;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-
-    let token = match extract_session_token().await {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-
-    let customer = sqlx::query_as::<_, Customer>(
-        "SELECT c.id, c.uuid, c.email, c.display_name
-         FROM customers c
-         JOIN customer_sessions s ON s.customer_id = c.id
-         WHERE s.token = ? AND s.expires_at > datetime('now')"
-    )
-    .bind(&token)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    Ok(customer)
+// GET /v1/auth/me
+pub async fn handler_get_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Customer> {
+    let customer = get_authenticated_customer(&state.pool, &headers).await?;
+    Ok(Json(customer))
 }
 
-#[server(Logout, "/api")]
-pub async fn logout() -> Result<(), ServerFnError> {
-    use leptos::prelude::use_context;
-    use leptos_axum::ResponseOptions;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-
-    if let Some(token) = extract_session_token().await {
+// POST /v1/auth/logout
+pub async fn handler_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    if let Some(token) = extract_bearer(&headers) {
         sqlx::query("DELETE FROM customer_sessions WHERE token = ?")
             .bind(&token)
-            .execute(&pool)
+            .execute(&state.pool)
             .await
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
+            .map_err(ApiError::from)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// PATCH /v1/auth/profile
+#[derive(Deserialize)]
+pub struct UpdateProfileRequest {
+    pub display_name: Option<String>,
+    pub email:        Option<String>,
+}
+
+pub async fn handler_update_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateProfileRequest>,
+) -> ApiResult<Customer> {
+    let customer = get_authenticated_customer(&state.pool, &headers).await?;
+
+    if let Some(name) = body.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        sqlx::query("UPDATE customers SET display_name = ? WHERE id = ?")
+            .bind(name).bind(customer.id)
+            .execute(&state.pool).await.map_err(ApiError::from)?;
+    }
+    if let Some(mail) = body.email.as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+    {
+        sqlx::query("UPDATE customers SET email = ? WHERE id = ?")
+            .bind(mail).bind(customer.id)
+            .execute(&state.pool).await.map_err(ApiError::from)?;
     }
 
-    let response_opts = use_context::<ResponseOptions>()
-        .ok_or_else(|| ServerFnError::new("ResponseOptions not found"))?;
-    response_opts.append_header(
-        axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_static(
-            "session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"
-        ),
-    );
-
-    Ok(())
-}
-
-// ─── サーバー関数: 顧客ボトル ─────────────────────────────────
-
-#[server(GetMyBottles, "/api")]
-pub async fn get_my_bottles() -> Result<Vec<MyBottleItem>, ServerFnError> {
-    use leptos::prelude::use_context;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-
-    let customer = get_authenticated_customer(&pool).await?;
-
-    let items = sqlx::query_as::<_, MyBottleItem>(
-        "SELECT b.id, s.name as shop_name, b.nfc_uid, b.drink_name,
-                b.remaining_percent, b.kept_at, b.expires_at
-         FROM customer_bottles cb
-         JOIN bottles b ON b.id = cb.bottle_id
-         JOIN shops s ON s.id = b.shop_id
-         WHERE cb.customer_id = ?
-         ORDER BY s.name, b.kept_at DESC"
+    let updated = sqlx::query_as::<_, Customer>(
+        "SELECT id, uuid, email, display_name FROM customers WHERE id = ?"
     )
     .bind(customer.id)
-    .fetch_all(&pool)
+    .fetch_one(&state.pool)
     .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    .map_err(ApiError::from)?;
 
-    Ok(items)
+    Ok(Json(updated))
 }
 
-#[server(LinkBottle, "/api")]
-pub async fn link_bottle(nfc_uid: String) -> Result<MyBottleItem, ServerFnError> {
-    use leptos::prelude::use_context;
+// ════════════════════════════════════════════════════════════
+// ハンドラー — パスキー
+// ════════════════════════════════════════════════════════════
 
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-
-    let customer = get_authenticated_customer(&pool).await?;
-
-    let bottle = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
-                kept_at, expires_at, email
-         FROM bottles WHERE nfc_uid = ?"
-    )
-    .bind(&nfc_uid)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?
-    .ok_or_else(|| ServerFnError::new("このタグは未登録です。スタッフにお声がけください。"))?;
-
-    // 紐づけ（既に紐づいていても無視）
-    sqlx::query(
-        "INSERT OR IGNORE INTO customer_bottles (customer_id, bottle_id) VALUES (?, ?)"
-    )
-    .bind(customer.id)
-    .bind(bottle.id)
-    .execute(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let item = sqlx::query_as::<_, MyBottleItem>(
-        "SELECT b.id, s.name as shop_name, b.nfc_uid, b.drink_name,
-                b.remaining_percent, b.kept_at, b.expires_at
-         FROM bottles b
-         JOIN shops s ON s.id = b.shop_id
-         WHERE b.id = ?"
-    )
-    .bind(bottle.id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    Ok(item)
+// POST /v1/auth/passkey/register/start
+#[derive(Deserialize)]
+pub struct PasskeyRegStartRequest {
+    pub email:        Option<String>,
+    pub display_name: Option<String>,
 }
 
-// ─── サーバー関数: パスキー ───────────────────────────────────
-
-#[server(HasPasskey, "/api")]
-pub async fn has_passkey() -> Result<bool, ServerFnError> {
-    use leptos::prelude::use_context;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-
-    let customer = get_authenticated_customer(&pool).await?;
-
-    let count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM passkey_credentials WHERE customer_id = ?"
-    )
-    .bind(customer.id)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    Ok(count.0 > 0)
+#[derive(Serialize)]
+pub struct PasskeyRegStartResponse {
+    pub uuid:           String,
+    pub challenge_json: String,
 }
 
-#[server(PasskeyRegisterStart, "/api")]
-pub async fn passkey_register_start() -> Result<String, ServerFnError> {
-    use leptos::prelude::use_context;
-    use crate::ssr::WebauthnState;
-    use webauthn_rs::prelude::Uuid;
+pub async fn handler_passkey_reg_start(
+    State(state): State<AppState>,
+    Json(body): Json<PasskeyRegStartRequest>,
+) -> ApiResult<PasskeyRegStartResponse> {
+    use webauthn_rs::prelude::Uuid as WUuid;
 
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-    let state = use_context::<WebauthnState>()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not initialized"))?;
+    let email_norm = body.email.as_deref()
+        .map(|e| e.trim().to_lowercase())
+        .filter(|e| !e.is_empty());
 
-    let customer = get_authenticated_customer(&pool).await?;
-    let user_uuid = Uuid::parse_str(&customer.uuid)
-        .map_err(|_| ServerFnError::new("UUID parse error"))?;
-
-    let username = customer.email.as_deref().unwrap_or(&customer.uuid).to_string();
-    let display = customer.display_name.as_deref().unwrap_or(&username).to_string();
-
-    let (ccr, reg_state) = state.webauthn
-        .start_passkey_registration(user_uuid, &username, &display, None)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    state.pending_regs.lock().unwrap()
-        .insert(customer.uuid.clone(), reg_state);
-
-    serde_json::to_string(&ccr)
-        .map_err(|e| ServerFnError::new(e.to_string()))
-}
-
-#[server(PasskeyRegisterFinish, "/api")]
-pub async fn passkey_register_finish(response_json: String) -> Result<(), ServerFnError> {
-    use leptos::prelude::use_context;
-    use crate::ssr::WebauthnState;
-    use webauthn_rs::prelude::RegisterPublicKeyCredential;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-    let state = use_context::<WebauthnState>()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not initialized"))?;
-
-    let customer = get_authenticated_customer(&pool).await?;
-
-    let reg_state = state.pending_regs.lock().unwrap()
-        .remove(&customer.uuid)
-        .ok_or_else(|| ServerFnError::new("登録セッションが見つかりません"))?;
-
-    let reg_response: RegisterPublicKeyCredential = serde_json::from_str(&response_json)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let passkey = state.webauthn
-        .finish_passkey_registration(&reg_response, &reg_state)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let public_key = serde_json::to_string(&passkey)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    sqlx::query(
-        "INSERT INTO passkey_credentials (customer_id, public_key) VALUES (?, ?)"
-    )
-    .bind(customer.id)
-    .bind(&public_key)
-    .execute(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    Ok(())
-}
-
-#[server(PasskeyLoginStart, "/api")]
-pub async fn passkey_login_start(email: String) -> Result<String, ServerFnError> {
-    use leptos::prelude::use_context;
-    use crate::ssr::WebauthnState;
-    use webauthn_rs::prelude::Passkey;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-    let state = use_context::<WebauthnState>()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not initialized"))?;
-
-    let email = email.trim().to_lowercase();
-
-    let customer = sqlx::query_as::<_, Customer>(
-        "SELECT id, uuid, email, display_name FROM customers WHERE email = ?"
-    )
-    .bind(&email)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?
-    .ok_or_else(|| ServerFnError::new("メールアドレスが見つかりません"))?;
-
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT public_key FROM passkey_credentials WHERE customer_id = ?"
-    )
-    .bind(customer.id)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    if rows.is_empty() {
-        return Err(ServerFnError::new("パスキーが登録されていません"));
-    }
-
-    let passkeys: Vec<Passkey> = rows.iter()
-        .filter_map(|(json,)| serde_json::from_str(json).ok())
-        .collect();
-
-    let (rcr, auth_state) = state.webauthn
-        .start_passkey_authentication(&passkeys)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    state.pending_auths.lock().unwrap()
-        .insert(email.clone(), auth_state);
-
-    serde_json::to_string(&rcr)
-        .map_err(|e| ServerFnError::new(e.to_string()))
-}
-
-#[server(PasskeyLoginFinish, "/api")]
-pub async fn passkey_login_finish(
-    email: String,
-    response_json: String,
-) -> Result<Customer, ServerFnError> {
-    use leptos::prelude::use_context;
-    use leptos_axum::ResponseOptions;
-    use crate::ssr::WebauthnState;
-    use webauthn_rs::prelude::PublicKeyCredential;
-    use chrono::Duration;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-    let state = use_context::<WebauthnState>()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not initialized"))?;
-
-    let email = email.trim().to_lowercase();
-
-    let auth_state = state.pending_auths.lock().unwrap()
-        .remove(&email)
-        .ok_or_else(|| ServerFnError::new("認証セッションが見つかりません"))?;
-
-    let auth_response: PublicKeyCredential = serde_json::from_str(&response_json)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    state.webauthn
-        .finish_passkey_authentication(&auth_response, &auth_state)
-        .map_err(|_| ServerFnError::new("パスキー認証に失敗しました"))?;
-
-    let customer = sqlx::query_as::<_, Customer>(
-        "SELECT id, uuid, email, display_name FROM customers WHERE email = ?"
-    )
-    .bind(&email)
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    // セッション作成
-    let session_token = uuid::Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + Duration::days(30);
-
-    sqlx::query(
-        "INSERT INTO customer_sessions (token, customer_id, expires_at) VALUES (?, ?, ?)"
-    )
-    .bind(&session_token)
-    .bind(customer.id)
-    .bind(expires_at)
-    .execute(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let response_opts = use_context::<ResponseOptions>()
-        .ok_or_else(|| ServerFnError::new("ResponseOptions not found"))?;
-    let cookie = format!(
-        "session={session_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000"
-    );
-    response_opts.append_header(
-        axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_str(&cookie)
-            .map_err(|e| ServerFnError::new(e.to_string()))?,
-    );
-
-    Ok(customer)
-}
-
-// ─── サーバー関数: 新規ユーザーパスキー登録 ─────────────────────
-
-#[server(PasskeyFirstRegStart, "/api")]
-pub async fn passkey_first_reg_start(
-    email: Option<String>,
-    display_name: Option<String>,
-) -> Result<(String, String), ServerFnError> {
-    use leptos::prelude::use_context;
-    use crate::ssr::WebauthnState;
-    use webauthn_rs::prelude::Uuid as WebauthnUuid;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-    let state = use_context::<WebauthnState>()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not initialized"))?;
-
-    let email_normalized = email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty());
-
-    // メールアドレスがある場合は既存アカウント検索
-    let existing = if let Some(ref e) = email_normalized {
+    let existing = if let Some(ref e) = email_norm {
         sqlx::query_as::<_, Customer>(
             "SELECT id, uuid, email, display_name FROM customers WHERE email = ?"
         )
-        .bind(e)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
+        .bind(e).fetch_optional(&state.pool).await.map_err(ApiError::from)?
     } else {
         None
     };
@@ -857,197 +429,142 @@ pub async fn passkey_first_reg_start(
             sqlx::query(
                 "INSERT INTO customers (uuid, email, display_name) VALUES (?, ?, ?)"
             )
-            .bind(&new_uuid)
-            .bind(&email_normalized)
-            .bind(&display_name)
-            .execute(&pool)
-            .await
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
-
+            .bind(&new_uuid).bind(&email_norm).bind(&body.display_name)
+            .execute(&state.pool).await.map_err(ApiError::from)?;
             sqlx::query_as::<_, Customer>(
                 "SELECT id, uuid, email, display_name FROM customers WHERE uuid = ?"
             )
-            .bind(&new_uuid)
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| ServerFnError::new(e.to_string()))?
+            .bind(&new_uuid).fetch_one(&state.pool).await.map_err(ApiError::from)?
         }
     };
 
-    let user_uuid = WebauthnUuid::parse_str(&customer.uuid)
-        .map_err(|_| ServerFnError::new("UUID parse error"))?;
-
-    // WebAuthn username にはメールか UUID を使用
+    let user_uuid = WUuid::parse_str(&customer.uuid)
+        .map_err(|_| ApiError::Internal("UUID parse error".into()))?;
     let username = customer.email.as_deref().unwrap_or(&customer.uuid).to_string();
-    let display = customer.display_name.as_deref().unwrap_or(&username).to_string();
+    let display  = customer.display_name.as_deref().unwrap_or(&username).to_string();
 
     let (ccr, reg_state) = state.webauthn
         .start_passkey_registration(user_uuid, &username, &display, None)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    state.pending_regs.lock().unwrap()
-        .insert(customer.uuid.clone(), reg_state);
+    state.pending_regs.lock().unwrap().insert(customer.uuid.clone(), reg_state);
 
     let challenge_json = serde_json::to_string(&ccr)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok((customer.uuid, challenge_json))
+    Ok(Json(PasskeyRegStartResponse { uuid: customer.uuid, challenge_json }))
 }
 
-#[server(PasskeyFirstRegFinish, "/api")]
-pub async fn passkey_first_reg_finish(
-    customer_uuid: String,
-    response_json: String,
-) -> Result<Customer, ServerFnError> {
-    use leptos::prelude::use_context;
-    use leptos_axum::ResponseOptions;
-    use crate::ssr::WebauthnState;
-    use webauthn_rs::prelude::RegisterPublicKeyCredential;
-    use chrono::Duration;
+// POST /v1/auth/passkey/register/finish
+#[derive(Deserialize)]
+pub struct PasskeyRegFinishRequest {
+    pub uuid:       String,
+    pub credential: serde_json::Value,
+}
 
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-    let state = use_context::<WebauthnState>()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not initialized"))?;
+pub async fn handler_passkey_reg_finish(
+    State(state): State<AppState>,
+    Json(body): Json<PasskeyRegFinishRequest>,
+) -> ApiResult<AuthResponse> {
+    use webauthn_rs::prelude::RegisterPublicKeyCredential;
 
     let reg_state = state.pending_regs.lock().unwrap()
-        .remove(&customer_uuid)
-        .ok_or_else(|| ServerFnError::new("登録セッションが見つかりません"))?;
+        .remove(&body.uuid)
+        .ok_or_else(|| ApiError::BadRequest("登録セッションが見つかりません".into()))?;
 
-    let reg_response: RegisterPublicKeyCredential = serde_json::from_str(&response_json)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let reg_resp: RegisterPublicKeyCredential = serde_json::from_value(body.credential)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let passkey = state.webauthn
-        .finish_passkey_registration(&reg_response, &reg_state)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .finish_passkey_registration(&reg_resp, &reg_state)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let public_key = serde_json::to_string(&passkey)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let customer = sqlx::query_as::<_, Customer>(
         "SELECT id, uuid, email, display_name FROM customers WHERE uuid = ?"
     )
-    .bind(&customer_uuid)
-    .fetch_one(&pool)
+    .bind(&body.uuid)
+    .fetch_one(&state.pool)
     .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    .map_err(ApiError::from)?;
 
-    sqlx::query(
-        "INSERT INTO passkey_credentials (customer_id, public_key) VALUES (?, ?)"
-    )
-    .bind(customer.id)
-    .bind(&public_key)
-    .execute(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    sqlx::query("INSERT INTO passkey_credentials (customer_id, public_key) VALUES (?, ?)")
+        .bind(customer.id).bind(&public_key)
+        .execute(&state.pool).await.map_err(ApiError::from)?;
 
-    let session_token2 = uuid::Uuid::new_v4().to_string();
-    let expires_at2 = Utc::now() + Duration::days(30);
-
-    sqlx::query(
-        "INSERT INTO customer_sessions (token, customer_id, expires_at) VALUES (?, ?, ?)"
-    )
-    .bind(&session_token2)
-    .bind(customer.id)
-    .bind(expires_at2)
-    .execute(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let resp_opts = use_context::<ResponseOptions>()
-        .ok_or_else(|| ServerFnError::new("ResponseOptions not found"))?;
-    let cookie2 = format!(
-        "session={session_token2}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000"
-    );
-    resp_opts.append_header(
-        axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_str(&cookie2)
-            .map_err(|e| ServerFnError::new(e.to_string()))?,
-    );
-
-    Ok(customer)
+    let token = create_customer_session(&state.pool, customer.id).await?;
+    Ok(Json(AuthResponse { token, customer }))
 }
 
-// ─── サーバー関数: メールなしパスキーログイン（discoverable）────
-// webauthn-rs 0.5 には start_discoverable_authentication がないため、
-// DB 上の全パスキーを allowCredentials に乗せて同等の動作を実現する。
+// POST /v1/auth/passkey/login/start
+#[derive(Serialize)]
+pub struct PasskeyLoginStartResponse {
+    pub session_id:     String,
+    pub challenge_json: String,
+}
 
-#[server(PasskeyDiscoverableStart, "/api")]
-pub async fn passkey_discoverable_start() -> Result<(String, String), ServerFnError> {
-    use leptos::prelude::use_context;
-    use crate::ssr::WebauthnState;
+pub async fn handler_passkey_login_start(
+    State(state): State<AppState>,
+) -> ApiResult<PasskeyLoginStartResponse> {
     use webauthn_rs::prelude::Passkey;
 
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-    let state = use_context::<WebauthnState>()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not initialized"))?;
-
-    // DB上の全パスキーを取得
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT public_key FROM passkey_credentials"
-    )
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT public_key FROM passkey_credentials")
+        .fetch_all(&state.pool).await.map_err(ApiError::from)?;
 
     let passkeys: Vec<Passkey> = rows.iter()
         .filter_map(|(json,)| serde_json::from_str(json).ok())
         .collect();
 
     if passkeys.is_empty() {
-        return Err(ServerFnError::new("登録済みのパスキーがありません"));
+        return Err(ApiError::BadRequest("登録済みのパスキーがありません".into()));
     }
 
     let (rcr, auth_state) = state.webauthn
         .start_passkey_authentication(&passkeys)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
     state.pending_discoverable_auths.lock().unwrap()
         .insert(session_id.clone(), auth_state);
 
     let challenge_json = serde_json::to_string(&rcr)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok((session_id, challenge_json))
+    Ok(Json(PasskeyLoginStartResponse { session_id, challenge_json }))
 }
 
-#[server(PasskeyDiscoverableFinish, "/api")]
-pub async fn passkey_discoverable_finish(
-    session_id: String,
-    response_json: String,
-) -> Result<Customer, ServerFnError> {
-    use leptos::prelude::use_context;
-    use leptos_axum::ResponseOptions;
-    use crate::ssr::WebauthnState;
-    use webauthn_rs::prelude::{PublicKeyCredential, Passkey};
-    use chrono::Duration;
+// POST /v1/auth/passkey/login/finish
+#[derive(Deserialize)]
+pub struct PasskeyLoginFinishRequest {
+    pub session_id:  String,
+    pub credential:  serde_json::Value,
+}
 
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-    let state = use_context::<WebauthnState>()
-        .ok_or_else(|| ServerFnError::new("WebAuthn not initialized"))?;
+pub async fn handler_passkey_login_finish(
+    State(state): State<AppState>,
+    Json(body): Json<PasskeyLoginFinishRequest>,
+) -> ApiResult<AuthResponse> {
+    use webauthn_rs::prelude::{PublicKeyCredential, Passkey};
 
     let auth_state = state.pending_discoverable_auths.lock().unwrap()
-        .remove(&session_id)
-        .ok_or_else(|| ServerFnError::new("認証セッションが見つかりません"))?;
+        .remove(&body.session_id)
+        .ok_or_else(|| ApiError::BadRequest("認証セッションが見つかりません".into()))?;
 
-    let auth_response: PublicKeyCredential = serde_json::from_str(&response_json)
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
+    let auth_resp: PublicKeyCredential = serde_json::from_value(body.credential)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let auth_result = state.webauthn
-        .finish_passkey_authentication(&auth_response, &auth_state)
-        .map_err(|_| ServerFnError::new("パスキー認証に失敗しました"))?;
+        .finish_passkey_authentication(&auth_resp, &auth_state)
+        .map_err(|_| ApiError::Unauthorized("パスキー認証に失敗しました".into()))?;
 
-    // 使われたクレデンシャルIDから顧客を特定
     let used_cred_id = auth_result.cred_id();
+
     let rows: Vec<(i32, String)> = sqlx::query_as(
         "SELECT customer_id, public_key FROM passkey_credentials"
     )
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    .fetch_all(&state.pool).await.map_err(ApiError::from)?;
 
     let customer_id = rows.iter()
         .find_map(|(cid, json)| {
@@ -1055,130 +572,326 @@ pub async fn passkey_discoverable_finish(
                 .filter(|pk| pk.cred_id() == used_cred_id)
                 .map(|_| *cid)
         })
-        .ok_or_else(|| ServerFnError::new("顧客が見つかりません"))?;
+        .ok_or_else(|| ApiError::Unauthorized("顧客が見つかりません".into()))?;
 
     let customer = sqlx::query_as::<_, Customer>(
         "SELECT id, uuid, email, display_name FROM customers WHERE id = ?"
     )
     .bind(customer_id)
-    .fetch_one(&pool)
+    .fetch_one(&state.pool)
     .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    .map_err(ApiError::from)?;
 
-    let session_token = uuid::Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + Duration::days(30);
+    let token = create_customer_session(&state.pool, customer.id).await?;
+    Ok(Json(AuthResponse { token, customer }))
+}
 
-    sqlx::query(
-        "INSERT INTO customer_sessions (token, customer_id, expires_at) VALUES (?, ?, ?)"
+// ════════════════════════════════════════════════════════════
+// ハンドラー — スタッフ
+// ════════════════════════════════════════════════════════════
+
+// POST /v1/staff/login
+#[derive(Deserialize)]
+pub struct StaffLoginRequest {
+    pub shop_id: i32,
+    pub pin:     String,
+}
+
+#[derive(Serialize)]
+pub struct StaffAuthResponse {
+    pub token: String,
+    pub shop:  Shop,
+}
+
+#[derive(sqlx::FromRow)]
+struct ShopWithPin {
+    id: i32,
+    name: String,
+    pin: String,
+}
+
+pub async fn handler_staff_login(
+    State(state): State<AppState>,
+    Json(body): Json<StaffLoginRequest>,
+) -> ApiResult<StaffAuthResponse> {
+
+
+
+
+    let shop_with_pin = sqlx::query_as::<_, ShopWithPin>(
+        "SELECT id, name, pin FROM shops WHERE id = ?"
     )
-    .bind(&session_token)
-    .bind(customer.id)
-    .bind(expires_at)
-    .execute(&pool)
+    .bind(body.shop_id)
+    .fetch_optional(&state.pool)
     .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::NotFound("店舗が見つかりません".into()))?;
 
-    let resp_opts = use_context::<ResponseOptions>()
-        .ok_or_else(|| ServerFnError::new("ResponseOptions not found"))?;
-    let cookie = format!(
-        "session={session_token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000"
-    );
-    resp_opts.append_header(
-        axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_str(&cookie)
-            .map_err(|e| ServerFnError::new(e.to_string()))?,
-    );
+    let ok = bcrypt::verify(&body.pin, &shop_with_pin.pin)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    Ok(customer)
-}
 
-// ─── スタッフ認証 ─────────────────────────────────────────────
-
-#[server(StaffLogin, "/api")]
-pub async fn staff_login(pin: String) -> Result<i32, ServerFnError> {
-    use leptos::prelude::use_context;
-    use leptos_axum::ResponseOptions;
-    use chrono::{Duration, Utc};
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-
-    let shop_id: i32 = sqlx::query_scalar("SELECT id FROM shops WHERE pin = ?")
-        .bind(&pin)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?
-        .ok_or_else(|| ServerFnError::new("PINが違います"))?;
-
-    let token = uuid::Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + Duration::days(7);
-
-    sqlx::query("INSERT INTO staff_sessions (token, shop_id, expires_at) VALUES (?, ?, ?)")
-        .bind(&token)
-        .bind(shop_id)
-        .bind(expires_at)
-        .execute(&pool)
-        .await
-        .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    let resp = use_context::<ResponseOptions>()
-        .ok_or_else(|| ServerFnError::new("ResponseOptions not found"))?;
-    let cookie = format!("staff_session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800");
-    resp.append_header(
-        axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_str(&cookie)
-            .map_err(|e| ServerFnError::new(e.to_string()))?,
-    );
-
-    Ok(shop_id)
-}
-
-#[server(GetStaffSession, "/api")]
-pub async fn get_staff_session() -> Result<Option<i32>, ServerFnError> {
-    use leptos::prelude::use_context;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-
-    let token = match extract_staff_token().await {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-
-    let shop_id: Option<i32> = sqlx::query_scalar(
-        "SELECT shop_id FROM staff_sessions WHERE token = ? AND expires_at > datetime('now')"
-    )
-    .bind(&token)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|e| ServerFnError::new(e.to_string()))?;
-
-    Ok(shop_id)
-}
-
-#[server(StaffLogout, "/api")]
-pub async fn staff_logout() -> Result<(), ServerFnError> {
-    use leptos::prelude::use_context;
-    use leptos_axum::ResponseOptions;
-
-    let pool = use_context::<sqlx::SqlitePool>()
-        .ok_or_else(|| ServerFnError::new("DB not found"))?;
-
-    if let Some(token) = extract_staff_token().await {
-        sqlx::query("DELETE FROM staff_sessions WHERE token = ?")
-            .bind(&token)
-            .execute(&pool)
-            .await
-            .map_err(|e| ServerFnError::new(e.to_string()))?;
+    if !ok {
+        return Err(ApiError::Unauthorized("PINが違います".into()));
     }
 
-    let resp = use_context::<ResponseOptions>()
-        .ok_or_else(|| ServerFnError::new("ResponseOptions not found"))?;
-    resp.append_header(
-        axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_str("staff_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
-            .map_err(|e| ServerFnError::new(e.to_string()))?,
-    );
+    let shop = Shop { id: shop_with_pin.id, name: shop_with_pin.name };
 
-    Ok(())
+    let token      = uuid::Uuid::new_v4().to_string();
+    let expires_at = Utc::now() + Duration::days(7);
+
+    sqlx::query(
+        "INSERT INTO staff_sessions (token, shop_id, expires_at) VALUES (?, ?, ?)"
+    )
+    .bind(&token).bind(shop.id).bind(expires_at)
+    .execute(&state.pool).await.map_err(ApiError::from)?;
+
+    Ok(Json(StaffAuthResponse { token, shop }))
+}
+
+
+// GET /v1/staff/me
+#[derive(Serialize, sqlx::FromRow)]
+pub struct StaffMeResponse {
+    pub shop_id:   i32,
+    pub shop_name: String,
+}
+
+pub async fn handler_staff_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<StaffMeResponse> {
+    let token = extract_bearer(&headers)
+        .ok_or_else(|| ApiError::Unauthorized("スタッフ認証が必要です".into()))?;
+
+    let me = sqlx::query_as::<_, StaffMeResponse>(
+        "SELECT ss.shop_id, s.name as shop_name
+         FROM staff_sessions ss
+         JOIN shops s ON s.id = ss.shop_id
+         WHERE ss.token = ? AND ss.expires_at > datetime('now')"
+    )
+    .bind(&token)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::Unauthorized("スタッフセッションが無効です".into()))?;
+
+    Ok(Json(me))
+}
+
+// POST /v1/staff/logout
+pub async fn handler_staff_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    if let Some(token) = extract_bearer(&headers) {
+        sqlx::query("DELETE FROM staff_sessions WHERE token = ?")
+            .bind(&token)
+            .execute(&state.pool)
+            .await
+            .map_err(ApiError::from)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// POST /v1/staff/bottles
+#[derive(Deserialize)]
+pub struct RegisterBottleRequest {
+    pub nfc_uid:     String,
+    pub guest_name:  String,
+    pub drink_name:  String,
+    pub expires_days: Option<i32>,
+    pub email:       Option<String>,
+}
+
+pub async fn handler_register_bottle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RegisterBottleRequest>,
+) -> ApiResult<Bottle> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let now        = Utc::now();
+    let expires_at = now + Duration::days(body.expires_days.unwrap_or(90) as i64);
+
+    let result = sqlx::query(
+        "INSERT INTO bottles
+         (shop_id, nfc_uid, guest_name, drink_name, kept_at, expires_at, remaining_percent, email)
+         VALUES (?, ?, ?, ?, ?, ?, 100, ?)"
+    )
+    .bind(shop_id)
+    .bind(&body.nfc_uid)
+    .bind(&body.guest_name)
+    .bind(&body.drink_name)
+    .bind(now)
+    .bind(expires_at)
+    .bind(&body.email)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    let bottle = sqlx::query_as::<_, Bottle>(
+        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
+                kept_at, expires_at, email
+         FROM bottles WHERE id = ?"
+    )
+    .bind(result.last_insert_rowid())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(bottle))
+}
+
+// GET /v1/staff/bottles
+pub async fn handler_get_shop_bottles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<Bottle>> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let bottles = sqlx::query_as::<_, Bottle>(
+        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
+                kept_at, expires_at, email
+         FROM bottles WHERE shop_id = ?
+         ORDER BY kept_at DESC"
+    )
+    .bind(shop_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(bottles))
+}
+
+// PATCH /v1/staff/bottles/:id
+#[derive(Deserialize)]
+pub struct UpdateBottleRequest {
+    pub remaining_percent: Option<i32>,
+    pub drink_name:        Option<String>,
+    pub expires_at:        Option<DateTime<Utc>>,
+}
+
+pub async fn handler_update_bottle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(bottle_id): Path<i32>,
+    Json(body): Json<UpdateBottleRequest>,
+) -> ApiResult<Bottle> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM bottles WHERE id = ? AND shop_id = ?"
+    )
+    .bind(bottle_id).bind(shop_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    if exists == 0 {
+        return Err(ApiError::NotFound("ボトルが見つかりません".into()));
+    }
+
+    if let Some(pct) = body.remaining_percent {
+        sqlx::query("UPDATE bottles SET remaining_percent = ? WHERE id = ?")
+            .bind(pct).bind(bottle_id)
+            .execute(&state.pool).await.map_err(ApiError::from)?;
+    }
+    if let Some(ref name) = body.drink_name {
+        sqlx::query("UPDATE bottles SET drink_name = ? WHERE id = ?")
+            .bind(name).bind(bottle_id)
+            .execute(&state.pool).await.map_err(ApiError::from)?;
+    }
+    if let Some(exp) = body.expires_at {
+        sqlx::query("UPDATE bottles SET expires_at = ? WHERE id = ?")
+            .bind(exp).bind(bottle_id)
+            .execute(&state.pool).await.map_err(ApiError::from)?;
+    }
+
+    let bottle = sqlx::query_as::<_, Bottle>(
+        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
+                kept_at, expires_at, email
+         FROM bottles WHERE id = ?"
+    )
+    .bind(bottle_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(bottle))
+}
+
+// ════════════════════════════════════════════════════════════
+// ハンドラー — 顧客ボトル
+// ════════════════════════════════════════════════════════════
+
+// GET /v1/customer/bottles
+pub async fn handler_get_my_bottles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<MyBottleItem>> {
+    let customer = get_authenticated_customer(&state.pool, &headers).await?;
+
+    let items = sqlx::query_as::<_, MyBottleItem>(
+        "SELECT b.id, s.name as shop_name, b.nfc_uid, b.drink_name,
+                b.remaining_percent, b.kept_at, b.expires_at
+         FROM customer_bottles cb
+         JOIN bottles b ON b.id = cb.bottle_id
+         JOIN shops s ON s.id = b.shop_id
+         WHERE cb.customer_id = ?
+         ORDER BY s.name, b.kept_at DESC"
+    )
+    .bind(customer.id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(items))
+}
+
+// POST /v1/customer/bottles/link
+#[derive(Deserialize)]
+pub struct LinkBottleRequest {
+    pub nfc_uid: String,
+}
+
+pub async fn handler_link_bottle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<LinkBottleRequest>,
+) -> ApiResult<MyBottleItem> {
+    let customer = get_authenticated_customer(&state.pool, &headers).await?;
+
+    let bottle = sqlx::query_as::<_, Bottle>(
+        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
+                kept_at, expires_at, email
+         FROM bottles WHERE nfc_uid = ?"
+    )
+    .bind(&body.nfc_uid)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::NotFound(
+        "このタグは未登録です。スタッフにお声がけください。".into()
+    ))?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO customer_bottles (customer_id, bottle_id) VALUES (?, ?)"
+    )
+    .bind(customer.id).bind(bottle.id)
+    .execute(&state.pool).await.map_err(ApiError::from)?;
+
+    let item = sqlx::query_as::<_, MyBottleItem>(
+        "SELECT b.id, s.name as shop_name, b.nfc_uid, b.drink_name,
+                b.remaining_percent, b.kept_at, b.expires_at
+         FROM bottles b
+         JOIN shops s ON s.id = b.shop_id
+         WHERE b.id = ?"
+    )
+    .bind(bottle.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(item))
 }
