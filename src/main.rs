@@ -17,6 +17,7 @@ use bottlekanri::{
     handler_register_bottle, handler_get_shop_bottles, handler_update_bottle,
     handler_get_my_bottles, handler_link_bottle,
     handler_analyze_bottle_image,
+    run_notification_loop,
 };
 
 #[tokio::main]
@@ -114,11 +115,13 @@ async fn main() {
         .route("/v1/customer/bottles",      get(handler_get_my_bottles))
         .route("/v1/customer/bottles/link", post(handler_link_bottle))
         .layer(cors)
-        .with_state(state);
+        .with_state(state.clone());
 
     // ─── 起動 ────────────────────────────────────────────────
     let addr = std::env::var("BIND_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+
+    tokio::spawn(run_notification_loop(state.pool.clone()));
 
     tracing::info!("サーバー起動: http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

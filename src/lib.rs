@@ -31,6 +31,17 @@ pub enum ApiError {
     Internal(String),
 }
 
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Unauthorized(m) => write!(f, "{}", m),
+            ApiError::NotFound(m)     => write!(f, "{}", m),
+            ApiError::BadRequest(m)   => write!(f, "{}", m),
+            ApiError::Internal(m)     => write!(f, "{}", m),
+        }
+    }
+}
+
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         ApiError::Internal(e.to_string())
@@ -981,4 +992,120 @@ pub async fn handler_analyze_bottle_image(
         brand:       parsed["brand"].as_str().map(String::from),
         spirit_type: parsed["spirit_type"].as_str().map(String::from),
     }))
+}
+
+// ════════════════════════════════════════════════════════════
+// 期限通知
+// ════════════════════════════════════════════════════════════
+
+#[derive(sqlx::FromRow)]
+struct ExpiringBottle {
+    guest_name: Option<String>,
+    drink_name: Option<String>,
+    email:      String,
+    expires_at: DateTime<Utc>,
+    shop_name:  String,
+}
+
+async fn send_expiry_email(to_email: &str, shop_name: &str, body: &str) -> Result<(), ApiError> {
+    use lettre::{
+        transport::smtp::authentication::Credentials,
+        AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    };
+
+    let smtp_host = match std::env::var("SMTP_HOST") {
+        Ok(h) => h,
+        Err(_) => {
+            tracing::info!("=== 期限通知 (dev mode) === To: {} | {}", to_email, body);
+            return Ok(());
+        }
+    };
+
+    let smtp_port: u16 = std::env::var("SMTP_PORT")
+        .ok().and_then(|p| p.parse().ok()).unwrap_or(587);
+    let smtp_user = std::env::var("SMTP_USER").unwrap_or_default();
+    let smtp_pass = std::env::var("SMTP_PASS").unwrap_or_default();
+    let from_addr = std::env::var("SMTP_FROM")
+        .unwrap_or_else(|_| "noreply@bottlekanri.app".to_string());
+
+    let email = Message::builder()
+        .from(from_addr.parse().map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
+        .to(to_email.parse().map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
+        .subject(format!("【{}】ボトルキープ期限のお知らせ", shop_name))
+        .body(body.to_string())
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp_host)
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .port(smtp_port)
+        .credentials(Credentials::new(smtp_user, smtp_pass))
+        .build()
+        .send(email)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(())
+}
+
+async fn notify_expiring_bottles(pool: &SqlitePool) {
+    let bottles = match sqlx::query_as::<_, ExpiringBottle>(
+        "SELECT b.guest_name, b.drink_name, b.email, b.expires_at, s.name as shop_name
+         FROM bottles b
+         JOIN shops s ON s.id = b.shop_id
+         WHERE b.email IS NOT NULL
+         AND b.expires_at BETWEEN datetime('now', '+6 days') AND datetime('now', '+7 days')"
+    )
+    .fetch_all(pool)
+    .await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("期限通知クエリ失敗: {}", e);
+            return;
+        }
+    };
+
+    tracing::info!("期限通知対象: {}件", bottles.len());
+
+    for bottle in bottles {
+        let body = format!(
+            "{}様\n\n{}の「{}」のボトルキープ期限が7日後に迫っています。\n\n期限: {}\n\nご来店お待ちしております。",
+            bottle.guest_name.as_deref().unwrap_or("お客様"),
+            bottle.shop_name,
+            bottle.drink_name.as_deref().unwrap_or("ボトル"),
+            bottle.expires_at.format("%Y年%m月%d日"),
+        );
+
+        if let Err(e) = send_expiry_email(&bottle.email, &bottle.shop_name, &body).await {
+            tracing::error!("通知メール送信失敗 to {}: {}", bottle.email, e);
+        } else {
+            tracing::info!("通知メール送信完了: {}", bottle.email);
+        }
+    }
+}
+
+pub async fn run_notification_loop(pool: SqlitePool) {
+    let hour: u32 = std::env::var("NOTIFY_HOUR")
+        .ok()
+        .and_then(|h| h.parse().ok())
+        .unwrap_or(13);
+
+    loop {
+        let now = Utc::now();
+        let target = now.date_naive()
+            .and_hms_opt(hour, 0, 0)
+            .unwrap()
+            .and_utc();
+
+        let next_run = if now < target {
+            target
+        } else {
+            target + Duration::days(1)
+        };
+
+        let sleep_secs = (next_run - now).num_seconds().max(0) as u64;
+        tracing::info!("次の期限通知: {}秒後 ({}時)", sleep_secs, hour);
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+        notify_expiring_bottles(&pool).await;
+    }
 }
