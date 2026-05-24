@@ -1044,19 +1044,19 @@ async fn notify_expiring_bottles(pool: &SqlitePool) {
     let bottles = match sqlx::query_as::<_, ExpiringBottle>(
         "SELECT b.guest_name, b.drink_name, b.email, b.expires_at, s.name as shop_name,
                 CASE
-                    WHEN b.expires_at BETWEEN datetime('now', '+29 days') AND datetime('now', '+30 days') THEN 30
-                    WHEN b.expires_at BETWEEN datetime('now', '+6 days')  AND datetime('now', '+7 days')  THEN 7
-                    WHEN b.expires_at BETWEEN datetime('now', '+2 days')  AND datetime('now', '+3 days')  THEN 3
-                    WHEN b.expires_at BETWEEN datetime('now')             AND datetime('now', '+1 day')   THEN 0
+                    WHEN datetime(b.expires_at) BETWEEN datetime('now', '+29 days') AND datetime('now', '+30 days') THEN 30
+                    WHEN datetime(b.expires_at) BETWEEN datetime('now', '+6 days')  AND datetime('now', '+7 days')  THEN 7
+                    WHEN datetime(b.expires_at) BETWEEN datetime('now', '+2 days')  AND datetime('now', '+3 days')  THEN 3
+                    WHEN datetime(b.expires_at) BETWEEN datetime('now')             AND datetime('now', '+1 day')   THEN 0
                 END as days_remaining
          FROM bottles b
          JOIN shops s ON s.id = b.shop_id
          WHERE b.email IS NOT NULL
          AND (
-             b.expires_at BETWEEN datetime('now', '+29 days') AND datetime('now', '+30 days')
-             OR b.expires_at BETWEEN datetime('now', '+6 days')  AND datetime('now', '+7 days')
-             OR b.expires_at BETWEEN datetime('now', '+2 days')  AND datetime('now', '+3 days')
-             OR b.expires_at BETWEEN datetime('now')             AND datetime('now', '+1 day')
+             datetime(b.expires_at) BETWEEN datetime('now', '+29 days') AND datetime('now', '+30 days')
+             OR datetime(b.expires_at) BETWEEN datetime('now', '+6 days')  AND datetime('now', '+7 days')
+             OR datetime(b.expires_at) BETWEEN datetime('now', '+2 days')  AND datetime('now', '+3 days')
+             OR datetime(b.expires_at) BETWEEN datetime('now')             AND datetime('now', '+1 day')
          )"
     )
     .fetch_all(pool)
@@ -1094,6 +1094,27 @@ async fn notify_expiring_bottles(pool: &SqlitePool) {
             tracing::info!("通知メール送信完了: {} ({}日前)", bottle.email, bottle.days_remaining);
         }
     }
+}
+
+pub async fn handler_notify_test(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let token = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::Unauthorized("認証が必要です".into()))?;
+
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM staff_sessions WHERE token = ?")
+        .bind(token)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::from)
+        .and_then(|c| if c > 0 { Ok(()) } else { Err(ApiError::Unauthorized("無効なトークンです".into())) })?;
+
+    notify_expiring_bottles(&state.pool).await;
+    Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn run_notification_loop(pool: SqlitePool) {

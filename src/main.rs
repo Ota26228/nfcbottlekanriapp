@@ -17,6 +17,7 @@ use bottlekanri::{
     handler_register_bottle, handler_get_shop_bottles, handler_update_bottle,
     handler_get_my_bottles, handler_link_bottle,
     handler_analyze_bottle_image,
+    handler_notify_test,
     run_notification_loop,
 };
 
@@ -111,6 +112,8 @@ async fn main() {
         .route("/v1/staff/bottles/{id}", patch(handler_update_bottle))
         // AI画像解析
         .route("/v1/staff/bottles/analyze-image", post(handler_analyze_bottle_image))
+        // テスト用（通知即時実行）
+        .route("/v1/staff/notify-test", post(handler_notify_test))
         // 顧客ボトル
         .route("/v1/customer/bottles",      get(handler_get_my_bottles))
         .route("/v1/customer/bottles/link", post(handler_link_bottle))
