@@ -20,7 +20,6 @@ axum        = "0.8"
 tokio       = { version = "1", features = ["rt-multi-thread", "macros"] }
 tower-http  = { version = "0.6", features = ["cors", "trace"] }
 url         = "2"
-lettre      = { version = "0.11", default-features = false, features = ["tokio1-native-tls", "smtp-transport", "builder"] }
 webauthn-rs = "0.5"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter"] }

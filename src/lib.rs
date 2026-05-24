@@ -167,46 +167,42 @@ async fn create_customer_session(pool: &SqlitePool, customer_id: i32) -> Result<
 // ─── メール送信 ────────────────────────────────────────────────
 
 async fn send_magic_link_email(to_email: &str, link: &str) -> Result<(), ApiError> {
-    use lettre::{
-        transport::smtp::authentication::Credentials,
-        AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    };
-
-    let body = format!(
-        "以下のリンクをタップしてログインしてください（15分以内）:\n\n{}\n\n心当たりがない場合は無視してください。",
-        link
-    );
-
-    let smtp_host = match std::env::var("SMTP_HOST") {
-        Ok(h) => h,
+    let api_key = match std::env::var("RESEND_API_KEY") {
+        Ok(k) => k,
         Err(_) => {
             tracing::info!("=== Magic Link (dev mode) === To: {} | Link: {}", to_email, link);
             return Ok(());
         }
     };
 
-    let smtp_port: u16 = std::env::var("SMTP_PORT")
-        .ok().and_then(|p| p.parse().ok()).unwrap_or(587);
-    let smtp_user = std::env::var("SMTP_USER").unwrap_or_default();
-    let smtp_pass = std::env::var("SMTP_PASS").unwrap_or_default();
-    let from_addr = std::env::var("SMTP_FROM")
-        .unwrap_or_else(|_| "noreply@bottlekanri.app".to_string());
+    let from_addr = std::env::var("RESEND_FROM")
+        .unwrap_or_else(|_| "onboarding@resend.dev".to_string());
 
-    let email = Message::builder()
-        .from(from_addr.parse().map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
-        .to(to_email.parse().map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
-        .subject("【ボトルキープ】ログインリンク")
-        .body(body)
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let body = format!(
+        "以下のリンクをタップしてログインしてください（15分以内）:\n\n{}\n\n心当たりがない場合は無視してください。",
+        link
+    );
 
-    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp_host)
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .port(smtp_port)
-        .credentials(Credentials::new(smtp_user, smtp_pass))
-        .build()
-        .send(email)
+    let payload = serde_json::json!({
+        "from": from_addr,
+        "to": [to_email],
+        "subject": "【ボトルキープ】ログインリンク",
+        "text": body,
+    });
+
+    let client = reqwest::Client::new();
+    let res = client
+        .post("https://api.resend.com/emails")
+        .bearer_auth(&api_key)
+        .json(&payload)
+        .send()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    if !res.status().is_success() {
+        let msg = res.text().await.unwrap_or_default();
+        return Err(ApiError::Internal(format!("Resend error: {}", msg)));
+    }
 
     Ok(())
 }
@@ -1009,41 +1005,37 @@ struct ExpiringBottle {
 }
 
 async fn send_expiry_email(to_email: &str, shop_name: &str, body: &str) -> Result<(), ApiError> {
-    use lettre::{
-        transport::smtp::authentication::Credentials,
-        AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    };
-
-    let smtp_host = match std::env::var("SMTP_HOST") {
-        Ok(h) => h,
+    let api_key = match std::env::var("RESEND_API_KEY") {
+        Ok(k) => k,
         Err(_) => {
             tracing::info!("=== 期限通知 (dev mode) === To: {} | {}", to_email, body);
             return Ok(());
         }
     };
 
-    let smtp_port: u16 = std::env::var("SMTP_PORT")
-        .ok().and_then(|p| p.parse().ok()).unwrap_or(587);
-    let smtp_user = std::env::var("SMTP_USER").unwrap_or_default();
-    let smtp_pass = std::env::var("SMTP_PASS").unwrap_or_default();
-    let from_addr = std::env::var("SMTP_FROM")
-        .unwrap_or_else(|_| "noreply@bottlekanri.app".to_string());
+    let from_addr = std::env::var("RESEND_FROM")
+        .unwrap_or_else(|_| "onboarding@resend.dev".to_string());
 
-    let email = Message::builder()
-        .from(from_addr.parse().map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
-        .to(to_email.parse().map_err(|e: lettre::address::AddressError| ApiError::Internal(e.to_string()))?)
-        .subject(format!("【{}】ボトルキープ期限のお知らせ", shop_name))
-        .body(body.to_string())
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let payload = serde_json::json!({
+        "from": from_addr,
+        "to": [to_email],
+        "subject": format!("【{}】ボトルキープ期限のお知らせ", shop_name),
+        "text": body,
+    });
 
-    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp_host)
-        .map_err(|e| ApiError::Internal(e.to_string()))?
-        .port(smtp_port)
-        .credentials(Credentials::new(smtp_user, smtp_pass))
-        .build()
-        .send(email)
+    let client = reqwest::Client::new();
+    let res = client
+        .post("https://api.resend.com/emails")
+        .bearer_auth(&api_key)
+        .json(&payload)
+        .send()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    if !res.status().is_success() {
+        let msg = res.text().await.unwrap_or_default();
+        return Err(ApiError::Internal(format!("Resend error: {}", msg)));
+    }
 
     Ok(())
 }
