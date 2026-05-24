@@ -225,6 +225,39 @@ pub async fn handler_get_shop(
     Ok(Json(shop))
 }
 
+// POST /v1/shops
+#[derive(Deserialize)]
+pub struct RegisterShopRequest {
+    pub name: String,
+    pub pin:  String,
+}
+
+pub async fn handler_register_shop(
+    State(state): State<AppState>,
+    Json(body): Json<RegisterShopRequest>,
+) -> ApiResult<Shop> {
+    if body.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("店舗名を入力してください".into()));
+    }
+    if body.pin.len() < 4 {
+        return Err(ApiError::BadRequest("PINは4文字以上にしてください".into()));
+    }
+
+    let hashed = bcrypt::hash(&body.pin, bcrypt::DEFAULT_COST)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO shops (name, pin) VALUES (?, ?) RETURNING id"
+    )
+    .bind(body.name.trim())
+    .bind(&hashed)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(Shop { id: id as i32, name: body.name.trim().to_string() }))
+}
+
 // ════════════════════════════════════════════════════════════
 // ハンドラー — 顧客認証
 // ════════════════════════════════════════════════════════════
