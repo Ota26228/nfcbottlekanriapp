@@ -8,7 +8,7 @@ use bcrypt;
 
 use bottlekanri::{
     AppState,
-    handler_get_shop, handler_register_shop,
+    handler_list_shops, handler_get_shop, handler_register_shop,
     handler_request_magic_link, handler_verify_magic_link,
     handler_get_me, handler_logout, handler_update_profile,
     handler_passkey_reg_start, handler_passkey_reg_finish,
@@ -90,7 +90,7 @@ async fn main() {
     // ─── ルーター ────────────────────────────────────────────
     let app = Router::new()
         // ショップ
-        .route("/v1/shops", post(handler_register_shop))
+        .route("/v1/shops", get(handler_list_shops).post(handler_register_shop))
         .route("/v1/shops/{shop_id}", get(handler_get_shop))
         // 顧客認証
         .route("/v1/auth/magic-link/send",    post(handler_request_magic_link))

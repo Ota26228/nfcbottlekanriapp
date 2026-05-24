@@ -212,6 +212,16 @@ async fn send_magic_link_email(to_email: &str, link: &str) -> Result<(), ApiErro
 // ════════════════════════════════════════════════════════════
 
 // GET /v1/shops/:shop_id
+pub async fn handler_list_shops(
+    State(state): State<AppState>,
+) -> ApiResult<Vec<Shop>> {
+    let shops = sqlx::query_as::<_, Shop>("SELECT id, name FROM shops ORDER BY id")
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(shops))
+}
+
 pub async fn handler_get_shop(
     State(state): State<AppState>,
     Path(shop_id): Path<i32>,
