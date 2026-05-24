@@ -18,8 +18,8 @@ info:
 servers:
   - url: http://localhost:3000/v1
     description: 開発環境
-  - url: https://api.bottlekeep.app/v1
-    description: 本番環境（予定）
+  - url: https://nfcbottlekanriapp.fly.dev/v1
+    description: 本番環境
 
 tags:
   - name: shops
@@ -35,6 +35,40 @@ tags:
 paths:
 
   # ─── 店舗 ────────────────────────────────────────────────
+
+  /shops:
+    post:
+      tags: [shops]
+      summary: 新規店舗を登録
+      description: |
+        店舗名とPINを設定して新規店舗を登録する。認証不要。
+        登録後に返ってくる `id` をスタッフログインの `shop_id` に使う。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, pin]
+              properties:
+                name:
+                  type: string
+                  description: 店舗名
+                pin:
+                  type: string
+                  description: スタッフログイン用PIN（4文字以上）
+            example:
+              name: "BAR LUMEN"
+              pin: "1234"
+      responses:
+        "200":
+          description: 登録された店舗情報
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Shop"
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   /shops/{shop_id}:
     get:
@@ -563,6 +597,30 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+
+  /staff/notify-test:
+    post:
+      tags: [staff]
+      summary: 期限通知を即時テスト実行（開発用）
+      description: |
+        通知ループを待たずに今すぐ期限通知チェックを実行する。
+        期限ウィンドウ内のボトルに対してメールが送られる。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 実行成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+              example:
+                ok: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   # ─── 顧客: マイボトル ────────────────────────────────────
 
