@@ -71,15 +71,33 @@ pub struct Shop {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Drink {
+    pub id:      i32,
+    pub shop_id: i32,
+    pub name:    String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Bottle {
     pub id:                i32,
     pub shop_id:           i32,
+    pub customer_id:       Option<i32>,
     pub guest_name:        Option<String>,
     pub drink_name:        Option<String>,
     pub remaining_percent: i32,
+    pub status:            String,
     pub kept_at:           Option<DateTime<Utc>>,
     pub expires_at:        Option<DateTime<Utc>>,
     pub email:             Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct PendingBottleItem {
+    pub id:                i32,
+    pub drink_name:        Option<String>,
+    pub remaining_percent: i32,
+    pub display_name:      Option<String>,
+    pub requested_at:      Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
@@ -285,6 +303,81 @@ pub async fn handler_register_shop(
     .map_err(ApiError::from)?;
 
     Ok(Json(Shop { id: id as i32, name: body.name.trim().to_string() }))
+}
+
+// ════════════════════════════════════════════════════════════
+// ハンドラー — お酒管理
+// ════════════════════════════════════════════════════════════
+
+// GET /v1/shops/:shop_id/drinks
+pub async fn handler_list_shop_drinks(
+    State(state): State<AppState>,
+    Path(shop_id): Path<i32>,
+) -> ApiResult<Vec<Drink>> {
+    let drinks = sqlx::query_as::<_, Drink>(
+        "SELECT id, shop_id, name FROM drinks WHERE shop_id = ? ORDER BY name ASC"
+    )
+    .bind(shop_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(drinks))
+}
+
+// POST /v1/staff/drinks
+#[derive(Deserialize)]
+pub struct AddDrinkRequest {
+    pub name: String,
+}
+
+pub async fn handler_add_drink(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AddDrinkRequest>,
+) -> ApiResult<Drink> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    if body.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("酒名を入力してください".into()));
+    }
+
+    let id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO drinks (shop_id, name) VALUES (?, ?) RETURNING id"
+    )
+    .bind(shop_id)
+    .bind(body.name.trim())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref db) if db.message().contains("UNIQUE") =>
+            ApiError::BadRequest("その酒名はすでに登録されています".into()),
+        other => ApiError::from(other),
+    })?;
+
+    Ok(Json(Drink { id: id as i32, shop_id, name: body.name.trim().to_string() }))
+}
+
+// DELETE /v1/staff/drinks/:id
+pub async fn handler_delete_drink(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(drink_id): Path<i32>,
+) -> Result<StatusCode, ApiError> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let affected = sqlx::query(
+        "DELETE FROM drinks WHERE id = ? AND shop_id = ?"
+    )
+    .bind(drink_id).bind(shop_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::from)?
+    .rows_affected();
+
+    if affected == 0 {
+        return Err(ApiError::NotFound("お酒が見つかりません".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ════════════════════════════════════════════════════════════
@@ -813,8 +906,8 @@ pub async fn handler_register_bottle(
 
     let result = sqlx::query(
         "INSERT INTO bottles
-         (shop_id, guest_name, drink_name, kept_at, expires_at, remaining_percent, email)
-         VALUES (?, ?, ?, ?, ?, 100, ?)"
+         (shop_id, guest_name, drink_name, kept_at, expires_at, remaining_percent, email, status)
+         VALUES (?, ?, ?, ?, ?, 100, ?, 'active')"
     )
     .bind(shop_id)
     .bind(&body.guest_name)
@@ -827,8 +920,8 @@ pub async fn handler_register_bottle(
     .map_err(ApiError::from)?;
 
     let bottle = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, guest_name, drink_name, remaining_percent,
-                kept_at, expires_at, email
+        "SELECT id, shop_id, customer_id, guest_name, drink_name, remaining_percent,
+                status, kept_at, expires_at, email
          FROM bottles WHERE id = ?"
     )
     .bind(result.last_insert_rowid())
@@ -847,9 +940,9 @@ pub async fn handler_get_shop_bottles(
     let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
 
     let bottles = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, guest_name, drink_name, remaining_percent,
-                kept_at, expires_at, email
-         FROM bottles WHERE shop_id = ?
+        "SELECT id, shop_id, customer_id, guest_name, drink_name, remaining_percent,
+                status, kept_at, expires_at, email
+         FROM bottles WHERE shop_id = ? AND status = 'active'
          ORDER BY kept_at DESC"
     )
     .bind(shop_id)
@@ -927,8 +1020,8 @@ pub async fn handler_update_bottle(
     }
 
     let bottle = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, guest_name, drink_name, remaining_percent,
-                kept_at, expires_at, email
+        "SELECT id, shop_id, customer_id, guest_name, drink_name, remaining_percent,
+                status, kept_at, expires_at, email
          FROM bottles WHERE id = ?"
     )
     .bind(bottle_id)
@@ -939,9 +1032,128 @@ pub async fn handler_update_bottle(
     Ok(Json(bottle))
 }
 
+// DELETE /v1/staff/bottles/:id
+pub async fn handler_delete_bottle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(bottle_id): Path<i32>,
+) -> Result<StatusCode, ApiError> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let affected = sqlx::query(
+        "DELETE FROM bottles WHERE id = ? AND shop_id = ?"
+    )
+    .bind(bottle_id).bind(shop_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::from)?
+    .rows_affected();
+
+    if affected == 0 {
+        return Err(ApiError::NotFound("ボトルが見つかりません".into()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ════════════════════════════════════════════════════════════
 // ハンドラー — 顧客ボトル
 // ════════════════════════════════════════════════════════════
+
+// POST /v1/customer/bottles/request
+#[derive(Deserialize)]
+pub struct CustomerBottleRequest {
+    pub shop_id:           i32,
+    pub drink_name:        String,
+    pub remaining_percent: i32,
+}
+
+pub async fn handler_customer_request_bottle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CustomerBottleRequest>,
+) -> Result<StatusCode, ApiError> {
+    let customer = get_authenticated_customer(&state.pool, &headers).await?;
+
+    if body.drink_name.trim().is_empty() {
+        return Err(ApiError::BadRequest("酒名を入力してください".into()));
+    }
+    let pct = body.remaining_percent.clamp(0, 100);
+
+    sqlx::query(
+        "INSERT INTO bottles
+         (shop_id, customer_id, drink_name, remaining_percent, status, kept_at)
+         VALUES (?, ?, ?, ?, 'pending', datetime('now'))"
+    )
+    .bind(body.shop_id)
+    .bind(customer.id)
+    .bind(body.drink_name.trim())
+    .bind(pct)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(StatusCode::CREATED)
+}
+
+// GET /v1/staff/bottles/pending
+pub async fn handler_get_pending_bottles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Vec<PendingBottleItem>> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let items = sqlx::query_as::<_, PendingBottleItem>(
+        "SELECT b.id, b.drink_name, b.remaining_percent,
+                c.display_name, b.kept_at as requested_at
+         FROM bottles b
+         JOIN customers c ON c.id = b.customer_id
+         WHERE b.shop_id = ? AND b.status = 'pending'
+         ORDER BY b.kept_at ASC"
+    )
+    .bind(shop_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(items))
+}
+
+// POST /v1/staff/bottles/:id/approve
+pub async fn handler_approve_bottle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(bottle_id): Path<i32>,
+) -> ApiResult<Bottle> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let affected = sqlx::query(
+        "UPDATE bottles SET status = 'active',
+         kept_at = datetime('now'),
+         expires_at = datetime('now', '+90 days')
+         WHERE id = ? AND shop_id = ? AND status = 'pending'"
+    )
+    .bind(bottle_id).bind(shop_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::from)?
+    .rows_affected();
+
+    if affected == 0 {
+        return Err(ApiError::NotFound("申請が見つかりません".into()));
+    }
+
+    let bottle = sqlx::query_as::<_, Bottle>(
+        "SELECT id, shop_id, customer_id, guest_name, drink_name, remaining_percent,
+                status, kept_at, expires_at, email
+         FROM bottles WHERE id = ?"
+    )
+    .bind(bottle_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(bottle))
+}
 
 // GET /v1/customer/bottles
 pub async fn handler_get_my_bottles(
@@ -953,10 +1165,9 @@ pub async fn handler_get_my_bottles(
     let items = sqlx::query_as::<_, MyBottleItem>(
         "SELECT b.id, s.name as shop_name, b.drink_name,
                 b.remaining_percent, b.kept_at, b.expires_at
-         FROM customer_bottles cb
-         JOIN bottles b ON b.id = cb.bottle_id
+         FROM bottles b
          JOIN shops s ON s.id = b.shop_id
-         WHERE cb.customer_id = ?
+         WHERE b.customer_id = ? AND b.status = 'active'
          ORDER BY s.name, b.kept_at DESC"
     )
     .bind(customer.id)
@@ -967,93 +1178,6 @@ pub async fn handler_get_my_bottles(
     Ok(Json(items))
 }
 
-
-// ════════════════════════════════════════════════════════════
-// ハンドラー — AI画像解析
-// ════════════════════════════════════════════════════════════
-
-// POST /v1/staff/bottles/analyze-image
-#[derive(Deserialize)]
-pub struct AnalyzeImageRequest {
-    pub image:      String, // base64エンコードされた画像
-    pub media_type: String, // "image/jpeg" or "image/png"
-}
-
-#[derive(Serialize)]
-pub struct AnalyzeImageResponse {
-    pub name:        Option<String>,
-    pub brand:       Option<String>,
-    pub spirit_type: Option<String>,
-}
-
-pub async fn handler_analyze_bottle_image(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<AnalyzeImageRequest>,
-) -> ApiResult<AnalyzeImageResponse> {
-    let _shop_id = get_authenticated_staff(&state.pool, &headers).await?;
-
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| ApiError::Internal("ANTHROPIC_API_KEY が設定されていません".into()))?;
-
-    let request_body = serde_json::json!({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 256,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": body.media_type,
-                        "data": body.image
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": "このボトルのラベルを読んで、以下のJSON形式のみで答えてください:\n{\"name\":\"商品名\",\"brand\":\"ブランド名\",\"spirit_type\":\"種類（ウイスキー、焼酎、ワインなど）\"}\n不明な項目はnullにしてください。JSONのみ返してください。"
-                }
-            ]
-        }]
-    });
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let resp_json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    let text = resp_json["content"][0]["text"]
-        .as_str()
-        .ok_or_else(|| ApiError::Internal("Claude APIの応答が不正です".into()))?;
-
-    // マークダウンのコードブロックを除去
-    let text = text.trim();
-    let text = text.strip_prefix("```json").unwrap_or(text);
-    let text = text.strip_prefix("```").unwrap_or(text);
-    let text = text.strip_suffix("```").unwrap_or(text);
-    let text = text.trim();
-
-    let parsed: serde_json::Value = serde_json::from_str(text)
-        .map_err(|e| ApiError::Internal(format!("パース失敗: {} / レスポンス: {}", e, text)))?;
-
-    Ok(Json(AnalyzeImageResponse {
-        name:        parsed["name"].as_str().map(String::from),
-        brand:       parsed["brand"].as_str().map(String::from),
-        spirit_type: parsed["spirit_type"].as_str().map(String::from),
-    }))
-}
 
 // ════════════════════════════════════════════════════════════
 // 期限通知

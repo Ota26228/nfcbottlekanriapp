@@ -10,14 +10,15 @@ use bcrypt;
 use bottlekanri::{
     AppState,
     handler_list_shops, handler_get_shop, handler_register_shop,
+    handler_list_shop_drinks, handler_add_drink, handler_delete_drink,
     handler_request_magic_link, handler_verify_magic_link,
     handler_get_me, handler_logout, handler_update_profile, handler_passkey_status,
     handler_passkey_reg_start, handler_passkey_reg_finish,
     handler_passkey_login_start, handler_passkey_login_finish,
     handler_staff_login, handler_staff_me, handler_staff_logout,
-    handler_register_bottle, handler_get_shop_bottles, handler_update_bottle,
-    handler_get_my_bottles,
-    handler_analyze_bottle_image,
+    handler_register_bottle, handler_get_shop_bottles, handler_update_bottle, handler_delete_bottle,
+    handler_get_pending_bottles, handler_approve_bottle,
+    handler_customer_request_bottle, handler_get_my_bottles,
     handler_notify_test,
     handler_admin_clear_magic_links,
     run_notification_loop,
@@ -43,6 +44,28 @@ async fn main() {
 
     sqlx::query(include_str!("../schema.sql"))
         .execute(&pool).await.expect("スキーマの作成に失敗しました");
+
+    // status カラム追加マイグレーション
+    let has_status: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('bottles') WHERE name='status'"
+    ).fetch_one(&pool).await.unwrap_or(0);
+    if has_status == 0 {
+        sqlx::query("ALTER TABLE bottles ADD COLUMN status TEXT DEFAULT 'active'")
+            .execute(&pool).await.expect("status カラム追加失敗");
+        sqlx::query("UPDATE bottles SET status = 'active' WHERE status IS NULL")
+            .execute(&pool).await.expect("status 初期化失敗");
+        tracing::info!("status カラムマイグレーション完了");
+    }
+
+    // customer_id カラム追加マイグレーション
+    let has_customer_id: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('bottles') WHERE name='customer_id'"
+    ).fetch_one(&pool).await.unwrap_or(0);
+    if has_customer_id == 0 {
+        sqlx::query("ALTER TABLE bottles ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
+            .execute(&pool).await.expect("customer_id カラム追加失敗");
+        tracing::info!("customer_id カラムマイグレーション完了");
+    }
 
     // nfc_uid カラム削除マイグレーション
     let has_nfc: i64 = sqlx::query_scalar(
@@ -124,6 +147,10 @@ async fn main() {
         // ショップ
         .route("/v1/shops", get(handler_list_shops).post(handler_register_shop))
         .route("/v1/shops/{shop_id}", get(handler_get_shop))
+        .route("/v1/shops/{shop_id}/drinks", get(handler_list_shop_drinks))
+        // お酒管理
+        .route("/v1/staff/drinks", post(handler_add_drink))
+        .route("/v1/staff/drinks/{id}", axum::routing::delete(handler_delete_drink))
         // 顧客認証
         .route("/v1/auth/magic-link/send",    post(handler_request_magic_link))
         .route("/v1/auth/magic-link/verify",  post(handler_verify_magic_link))
@@ -143,15 +170,16 @@ async fn main() {
         .route("/v1/staff/bottles",
             get(handler_get_shop_bottles).post(handler_register_bottle)
         )
-        .route("/v1/staff/bottles/{id}", patch(handler_update_bottle))
-        // AI画像解析
-        .route("/v1/staff/bottles/analyze-image", post(handler_analyze_bottle_image))
+        .route("/v1/staff/bottles/pending", get(handler_get_pending_bottles))
+        .route("/v1/staff/bottles/{id}", patch(handler_update_bottle).delete(handler_delete_bottle))
+        .route("/v1/staff/bottles/{id}/approve", post(handler_approve_bottle))
         // テスト用（通知即時実行）
         .route("/v1/staff/notify-test", post(handler_notify_test))
         // 一時管理用
         .route("/v1/admin/clear-magic-links", post(handler_admin_clear_magic_links))
         // 顧客ボトル
-        .route("/v1/customer/bottles",      get(handler_get_my_bottles))
+        .route("/v1/customer/bottles",         get(handler_get_my_bottles))
+        .route("/v1/customer/bottles/request", post(handler_customer_request_bottle))
         .layer(cors)
         .with_state(state.clone());
 

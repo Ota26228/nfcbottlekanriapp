@@ -14,13 +14,16 @@ CREATE TABLE IF NOT EXISTS staff_sessions (
 CREATE TABLE IF NOT EXISTS bottles (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     shop_id            INTEGER NOT NULL,
+    customer_id        INTEGER,
     guest_name         TEXT,
     drink_name         TEXT,
     remaining_percent  INTEGER DEFAULT 100,
+    status             TEXT DEFAULT 'active',
     kept_at            DATETIME,
     expires_at         DATETIME,
     email              TEXT,
-    FOREIGN KEY (shop_id) REFERENCES shops(id)
+    FOREIGN KEY (shop_id)   REFERENCES shops(id),
+    FOREIGN KEY (customer_id) REFERENCES customers(id)
 );
 
 CREATE TABLE IF NOT EXISTS customers (
@@ -36,6 +39,15 @@ CREATE TABLE IF NOT EXISTS customer_sessions (
     customer_id INTEGER NOT NULL,
     expires_at  DATETIME NOT NULL,
     FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+
+CREATE TABLE IF NOT EXISTS drinks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id    INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (shop_id) REFERENCES shops(id),
+    UNIQUE(shop_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS customer_bottles (
