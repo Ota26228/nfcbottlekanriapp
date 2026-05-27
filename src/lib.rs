@@ -74,7 +74,6 @@ pub struct Shop {
 pub struct Bottle {
     pub id:                i32,
     pub shop_id:           i32,
-    pub nfc_uid:           String,
     pub guest_name:        Option<String>,
     pub drink_name:        Option<String>,
     pub remaining_percent: i32,
@@ -95,7 +94,6 @@ pub struct Customer {
 pub struct MyBottleItem {
     pub id:                i32,
     pub shop_name:         String,
-    pub nfc_uid:           String,
     pub drink_name:        Option<String>,
     pub remaining_percent: i32,
     pub kept_at:           Option<DateTime<Utc>>,
@@ -178,16 +176,28 @@ async fn send_magic_link_email(to_email: &str, link: &str) -> Result<(), ApiErro
     let from_addr = std::env::var("RESEND_FROM")
         .unwrap_or_else(|_| "onboarding@resend.dev".to_string());
 
-    let body = format!(
+    let text_body = format!(
         "以下のリンクをタップしてログインしてください（15分以内）:\n\n{}\n\n心当たりがない場合は無視してください。",
         link
     );
+    let html_body = format!(r#"<!DOCTYPE html>
+<html lang="ja">
+<body style="font-family:sans-serif;background:#f4f4f4;padding:32px;">
+  <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;padding:32px;">
+    <h2 style="color:#1a1208;margin-bottom:8px;">ボトルキープ</h2>
+    <p style="color:#444;line-height:1.6;">以下のボタンをタップしてログインしてください。<br>リンクは<strong>15分間</strong>有効です。</p>
+    <a href="{}" style="display:inline-block;margin:24px 0;padding:14px 28px;background:#4A7FB5;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold;">ログインする</a>
+    <p style="color:#888;font-size:12px;">心当たりがない場合はこのメールを無視してください。</p>
+  </div>
+</body>
+</html>"#, link);
 
     let payload = serde_json::json!({
         "from": from_addr,
         "to": [to_email],
-        "subject": "【ボトルキープ】ログインリンク",
-        "text": body,
+        "subject": "ボトルキープ ログインリンク",
+        "text": text_body,
+        "html": html_body,
     });
 
     let client = reqwest::Client::new();
@@ -244,8 +254,17 @@ pub struct RegisterShopRequest {
 
 pub async fn handler_register_shop(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<RegisterShopRequest>,
 ) -> ApiResult<Shop> {
+    if let Ok(secret) = std::env::var("ADMIN_SECRET") {
+        let provided = extract_bearer(&headers)
+            .ok_or_else(|| ApiError::Unauthorized("管理者認証が必要です".into()))?;
+        if provided != secret {
+            return Err(ApiError::Unauthorized("管理者認証が無効です".into()));
+        }
+    }
+
     if body.name.trim().is_empty() {
         return Err(ApiError::BadRequest("店舗名を入力してください".into()));
     }
@@ -284,6 +303,21 @@ pub async fn handler_request_magic_link(
 ) -> Result<StatusCode, ApiError> {
     let email = body.email.trim().to_lowercase();
 
+    // expires_at が now+15分 のリンクが残っていれば直近1分以内に送信済み
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_magic_links WHERE email = ? AND expires_at > datetime('now', '+14 minutes')"
+    )
+    .bind(&email)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    if recent > 0 {
+        return Err(ApiError::BadRequest(
+            "直前にリンクを送信済みです。しばらく待ってから再試行してください。".into()
+        ));
+    }
+
     sqlx::query(
         "DELETE FROM auth_magic_links WHERE email = ? OR expires_at < datetime('now')"
     )
@@ -292,15 +326,13 @@ pub async fn handler_request_magic_link(
     .await
     .map_err(ApiError::from)?;
 
-    let token      = uuid::Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + Duration::minutes(15);
+    let token = uuid::Uuid::new_v4().to_string();
 
     sqlx::query(
-        "INSERT INTO auth_magic_links (token, email, expires_at) VALUES (?, ?, ?)"
+        "INSERT INTO auth_magic_links (token, email, expires_at) VALUES (?, ?, datetime('now', '+15 minutes'))"
     )
     .bind(&token)
     .bind(&email)
-    .bind(expires_at)
     .execute(&state.pool)
     .await
     .map_err(ApiError::from)?;
@@ -380,6 +412,22 @@ pub async fn handler_get_me(
 ) -> ApiResult<Customer> {
     let customer = get_authenticated_customer(&state.pool, &headers).await?;
     Ok(Json(customer))
+}
+
+// GET /v1/auth/passkey/status
+pub async fn handler_passkey_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<serde_json::Value> {
+    let customer = get_authenticated_customer(&state.pool, &headers).await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM passkey_credentials WHERE customer_id = ?"
+    )
+    .bind(customer.id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({ "registered": count > 0 })))
 }
 
 // POST /v1/auth/logout
@@ -747,7 +795,6 @@ pub async fn handler_staff_logout(
 // POST /v1/staff/bottles
 #[derive(Deserialize)]
 pub struct RegisterBottleRequest {
-    pub nfc_uid:     String,
     pub guest_name:  String,
     pub drink_name:  String,
     pub expires_days: Option<i32>,
@@ -766,11 +813,10 @@ pub async fn handler_register_bottle(
 
     let result = sqlx::query(
         "INSERT INTO bottles
-         (shop_id, nfc_uid, guest_name, drink_name, kept_at, expires_at, remaining_percent, email)
-         VALUES (?, ?, ?, ?, ?, ?, 100, ?)"
+         (shop_id, guest_name, drink_name, kept_at, expires_at, remaining_percent, email)
+         VALUES (?, ?, ?, ?, ?, 100, ?)"
     )
     .bind(shop_id)
-    .bind(&body.nfc_uid)
     .bind(&body.guest_name)
     .bind(&body.drink_name)
     .bind(now)
@@ -781,7 +827,7 @@ pub async fn handler_register_bottle(
     .map_err(ApiError::from)?;
 
     let bottle = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
+        "SELECT id, shop_id, guest_name, drink_name, remaining_percent,
                 kept_at, expires_at, email
          FROM bottles WHERE id = ?"
     )
@@ -801,7 +847,7 @@ pub async fn handler_get_shop_bottles(
     let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
 
     let bottles = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
+        "SELECT id, shop_id, guest_name, drink_name, remaining_percent,
                 kept_at, expires_at, email
          FROM bottles WHERE shop_id = ?
          ORDER BY kept_at DESC"
@@ -856,10 +902,32 @@ pub async fn handler_update_bottle(
         sqlx::query("UPDATE bottles SET expires_at = ? WHERE id = ?")
             .bind(exp).bind(bottle_id)
             .execute(&state.pool).await.map_err(ApiError::from)?;
+
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, String)>(
+            "SELECT b.email, b.guest_name, b.drink_name, s.name
+             FROM bottles b JOIN shops s ON s.id = b.shop_id WHERE b.id = ?"
+        )
+        .bind(bottle_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::from)?;
+
+        if let Some((Some(email), guest_name, drink_name, shop_name)) = row {
+            let msg = format!(
+                "{}様\n\n{}の「{}」のボトルキープ期限が変更されました。\n\n新しい期限: {}\n\nご来店お待ちしております。",
+                guest_name.as_deref().unwrap_or("お客様"),
+                shop_name,
+                drink_name.as_deref().unwrap_or("ボトル"),
+                exp.format("%Y年%m月%d日"),
+            );
+            if let Err(e) = send_expiry_email(&email, &shop_name, &msg).await {
+                tracing::error!("期限変更メール送信失敗: {}", e);
+            }
+        }
     }
 
     let bottle = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
+        "SELECT id, shop_id, guest_name, drink_name, remaining_percent,
                 kept_at, expires_at, email
          FROM bottles WHERE id = ?"
     )
@@ -883,7 +951,7 @@ pub async fn handler_get_my_bottles(
     let customer = get_authenticated_customer(&state.pool, &headers).await?;
 
     let items = sqlx::query_as::<_, MyBottleItem>(
-        "SELECT b.id, s.name as shop_name, b.nfc_uid, b.drink_name,
+        "SELECT b.id, s.name as shop_name, b.drink_name,
                 b.remaining_percent, b.kept_at, b.expires_at
          FROM customer_bottles cb
          JOIN bottles b ON b.id = cb.bottle_id
@@ -899,52 +967,6 @@ pub async fn handler_get_my_bottles(
     Ok(Json(items))
 }
 
-// POST /v1/customer/bottles/link
-#[derive(Deserialize)]
-pub struct LinkBottleRequest {
-    pub nfc_uid: String,
-}
-
-pub async fn handler_link_bottle(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<LinkBottleRequest>,
-) -> ApiResult<MyBottleItem> {
-    let customer = get_authenticated_customer(&state.pool, &headers).await?;
-
-    let bottle = sqlx::query_as::<_, Bottle>(
-        "SELECT id, shop_id, nfc_uid, guest_name, drink_name, remaining_percent,
-                kept_at, expires_at, email
-         FROM bottles WHERE nfc_uid = ?"
-    )
-    .bind(&body.nfc_uid)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::from)?
-    .ok_or_else(|| ApiError::NotFound(
-        "このタグは未登録です。スタッフにお声がけください。".into()
-    ))?;
-
-    sqlx::query(
-        "INSERT OR IGNORE INTO customer_bottles (customer_id, bottle_id) VALUES (?, ?)"
-    )
-    .bind(customer.id).bind(bottle.id)
-    .execute(&state.pool).await.map_err(ApiError::from)?;
-
-    let item = sqlx::query_as::<_, MyBottleItem>(
-        "SELECT b.id, s.name as shop_name, b.nfc_uid, b.drink_name,
-                b.remaining_percent, b.kept_at, b.expires_at
-         FROM bottles b
-         JOIN shops s ON s.id = b.shop_id
-         WHERE b.id = ?"
-    )
-    .bind(bottle.id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(ApiError::from)?;
-
-    Ok(Json(item))
-}
 
 // ════════════════════════════════════════════════════════════
 // ハンドラー — AI画像解析
@@ -1149,7 +1171,9 @@ pub async fn handler_notify_test(
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(|| ApiError::Unauthorized("認証が必要です".into()))?;
 
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM staff_sessions WHERE token = ?")
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM staff_sessions WHERE token = ? AND expires_at > datetime('now')"
+    )
         .bind(token)
         .fetch_one(&state.pool)
         .await
@@ -1160,11 +1184,32 @@ pub async fn handler_notify_test(
     Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
+pub async fn handler_admin_clear_magic_links(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    let secret = std::env::var("ADMIN_SECRET").unwrap_or_default();
+    let provided = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if secret.is_empty() || provided != secret {
+        return Err(ApiError::Unauthorized("unauthorized".into()));
+    }
+    let deleted: u64 = sqlx::query("DELETE FROM auth_magic_links")
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::from)?
+        .rows_affected();
+    Ok(axum::Json(serde_json::json!({ "deleted": deleted })))
+}
+
 pub async fn run_notification_loop(pool: SqlitePool) {
     let hour: u32 = std::env::var("NOTIFY_HOUR")
         .ok()
         .and_then(|h| h.parse().ok())
-        .unwrap_or(13);
+        .unwrap_or(3);
 
     loop {
         let now = Utc::now();

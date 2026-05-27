@@ -14,7 +14,6 @@ CREATE TABLE IF NOT EXISTS staff_sessions (
 CREATE TABLE IF NOT EXISTS bottles (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     shop_id            INTEGER NOT NULL,
-    nfc_uid            TEXT UNIQUE NOT NULL,
     guest_name         TEXT,
     drink_name         TEXT,
     remaining_percent  INTEGER DEFAULT 100,

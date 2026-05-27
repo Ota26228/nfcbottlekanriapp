@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use axum::{routing::{get, patch, post}, Router};
+use axum::http::HeaderValue;
 use tower_http::cors::{Any, CorsLayer};
 use url::Url;
 use webauthn_rs::prelude::WebauthnBuilder;
@@ -10,16 +11,19 @@ use bottlekanri::{
     AppState,
     handler_list_shops, handler_get_shop, handler_register_shop,
     handler_request_magic_link, handler_verify_magic_link,
-    handler_get_me, handler_logout, handler_update_profile,
+    handler_get_me, handler_logout, handler_update_profile, handler_passkey_status,
     handler_passkey_reg_start, handler_passkey_reg_finish,
     handler_passkey_login_start, handler_passkey_login_finish,
     handler_staff_login, handler_staff_me, handler_staff_logout,
     handler_register_bottle, handler_get_shop_bottles, handler_update_bottle,
-    handler_get_my_bottles, handler_link_bottle,
+    handler_get_my_bottles,
     handler_analyze_bottle_image,
     handler_notify_test,
+    handler_admin_clear_magic_links,
     run_notification_loop,
 };
+
+
 
 #[tokio::main]
 async fn main() {
@@ -40,7 +44,27 @@ async fn main() {
     sqlx::query(include_str!("../schema.sql"))
         .execute(&pool).await.expect("スキーマの作成に失敗しました");
 
-    let hashed_pin = bcrypt::hash("1234",bcrypt::DEFAULT_COST)
+    // nfc_uid カラム削除マイグレーション
+    let has_nfc: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('bottles') WHERE name='nfc_uid'"
+    ).fetch_one(&pool).await.unwrap_or(0);
+    if has_nfc > 0 {
+        sqlx::query("CREATE TABLE IF NOT EXISTS bottles_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, shop_id INTEGER NOT NULL,
+            guest_name TEXT, drink_name TEXT, remaining_percent INTEGER DEFAULT 100,
+            kept_at DATETIME, expires_at DATETIME, email TEXT,
+            FOREIGN KEY (shop_id) REFERENCES shops(id)
+        )").execute(&pool).await.expect("bottles_v2 作成失敗");
+        sqlx::query("INSERT INTO bottles_v2 (id,shop_id,guest_name,drink_name,remaining_percent,kept_at,expires_at,email)
+            SELECT id,shop_id,guest_name,drink_name,remaining_percent,kept_at,expires_at,email FROM bottles")
+            .execute(&pool).await.expect("データ移行失敗");
+        sqlx::query("DROP TABLE bottles").execute(&pool).await.expect("旧テーブル削除失敗");
+        sqlx::query("ALTER TABLE bottles_v2 RENAME TO bottles").execute(&pool).await.expect("リネーム失敗");
+        tracing::info!("nfc_uid マイグレーション完了");
+    }
+
+    let demo_pin = std::env::var("DEMO_PIN").unwrap_or_else(|_| "1234".to_string());
+    let hashed_pin = bcrypt::hash(&demo_pin, bcrypt::DEFAULT_COST)
         .expect("ハッシュ化失敗");
 
     sqlx::query("INSERT OR IGNORE INTO shops (id, name, pin) VALUES (1, 'デモバー',?)")
@@ -82,10 +106,18 @@ async fn main() {
     };
 
     // ─── CORS ────────────────────────────────────────────────
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = if let Ok(origin) = std::env::var("CORS_ORIGIN") {
+        let value = origin.parse::<HeaderValue>().expect("CORS_ORIGIN が不正なURL形式です");
+        CorsLayer::new()
+            .allow_origin(value)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    };
 
     // ─── ルーター ────────────────────────────────────────────
     let app = Router::new()
@@ -96,6 +128,7 @@ async fn main() {
         .route("/v1/auth/magic-link/send",    post(handler_request_magic_link))
         .route("/v1/auth/magic-link/verify",  post(handler_verify_magic_link))
         .route("/v1/auth/me",                 get(handler_get_me))
+        .route("/v1/auth/passkey/status",     get(handler_passkey_status))
         .route("/v1/auth/logout",             post(handler_logout))
         .route("/v1/auth/profile",            patch(handler_update_profile))
         // パスキー
@@ -115,9 +148,10 @@ async fn main() {
         .route("/v1/staff/bottles/analyze-image", post(handler_analyze_bottle_image))
         // テスト用（通知即時実行）
         .route("/v1/staff/notify-test", post(handler_notify_test))
+        // 一時管理用
+        .route("/v1/admin/clear-magic-links", post(handler_admin_clear_magic_links))
         // 顧客ボトル
         .route("/v1/customer/bottles",      get(handler_get_my_bottles))
-        .route("/v1/customer/bottles/link", post(handler_link_bottle))
         .layer(cors)
         .with_state(state.clone());
 
