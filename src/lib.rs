@@ -114,6 +114,7 @@ pub struct MyBottleItem {
     pub shop_name:         String,
     pub drink_name:        Option<String>,
     pub remaining_percent: i32,
+    pub status:            String,
     pub kept_at:           Option<DateTime<Utc>>,
     pub expires_at:        Option<DateTime<Utc>>,
 }
@@ -1062,9 +1063,7 @@ pub async fn handler_delete_bottle(
 // POST /v1/customer/bottles/request
 #[derive(Deserialize)]
 pub struct CustomerBottleRequest {
-    pub shop_id:           i32,
-    pub drink_name:        String,
-    pub remaining_percent: i32,
+    pub shop_id: i32,
 }
 
 pub async fn handler_customer_request_bottle(
@@ -1074,20 +1073,12 @@ pub async fn handler_customer_request_bottle(
 ) -> Result<StatusCode, ApiError> {
     let customer = get_authenticated_customer(&state.pool, &headers).await?;
 
-    if body.drink_name.trim().is_empty() {
-        return Err(ApiError::BadRequest("酒名を入力してください".into()));
-    }
-    let pct = body.remaining_percent.clamp(0, 100);
-
     sqlx::query(
-        "INSERT INTO bottles
-         (shop_id, customer_id, drink_name, remaining_percent, status, kept_at)
-         VALUES (?, ?, ?, ?, 'pending', datetime('now'))"
+        "INSERT INTO bottles (shop_id, customer_id, status, kept_at)
+         VALUES (?, ?, 'pending', datetime('now'))"
     )
     .bind(body.shop_id)
     .bind(customer.id)
-    .bind(body.drink_name.trim())
-    .bind(pct)
     .execute(&state.pool)
     .await
     .map_err(ApiError::from)?;
@@ -1119,19 +1110,37 @@ pub async fn handler_get_pending_bottles(
 }
 
 // POST /v1/staff/bottles/:id/approve
+#[derive(Deserialize)]
+pub struct ApproveBottleRequest {
+    pub drink_name:        String,
+    pub remaining_percent: i32,
+    pub expires_days:      Option<i32>,
+}
+
 pub async fn handler_approve_bottle(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(bottle_id): Path<i32>,
+    Json(body): Json<ApproveBottleRequest>,
 ) -> ApiResult<Bottle> {
     let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
 
+    if body.drink_name.trim().is_empty() {
+        return Err(ApiError::BadRequest("酒名を入力してください".into()));
+    }
+    let pct = body.remaining_percent.clamp(0, 100);
+    let expires_days = body.expires_days.unwrap_or(90);
+
     let affected = sqlx::query(
         "UPDATE bottles SET status = 'active',
+         drink_name = ?, remaining_percent = ?,
          kept_at = datetime('now'),
-         expires_at = datetime('now', '+90 days')
+         expires_at = datetime('now', '+' || ? || ' days')
          WHERE id = ? AND shop_id = ? AND status = 'pending'"
     )
+    .bind(body.drink_name.trim())
+    .bind(pct)
+    .bind(expires_days)
     .bind(bottle_id).bind(shop_id)
     .execute(&state.pool)
     .await
@@ -1164,11 +1173,11 @@ pub async fn handler_get_my_bottles(
 
     let items = sqlx::query_as::<_, MyBottleItem>(
         "SELECT b.id, s.name as shop_name, b.drink_name,
-                b.remaining_percent, b.kept_at, b.expires_at
+                b.remaining_percent, b.status, b.kept_at, b.expires_at
          FROM bottles b
          JOIN shops s ON s.id = b.shop_id
-         WHERE b.customer_id = ? AND b.status = 'active'
-         ORDER BY s.name, b.kept_at DESC"
+         WHERE b.customer_id = ? AND b.status IN ('active', 'pending')
+         ORDER BY b.status DESC, s.name, b.kept_at DESC"
     )
     .bind(customer.id)
     .fetch_all(&state.pool)
@@ -1178,6 +1187,87 @@ pub async fn handler_get_my_bottles(
     Ok(Json(items))
 }
 
+
+// ════════════════════════════════════════════════════════════
+// ハンドラー — AI画像解析
+// ════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+pub struct AnalyzeImageRequest {
+    pub image:      String,
+    pub media_type: String,
+}
+
+#[derive(Serialize)]
+pub struct AnalyzeImageResponse {
+    pub name:              Option<String>,
+    pub remaining_percent: Option<i32>,
+}
+
+pub async fn handler_analyze_bottle_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AnalyzeImageRequest>,
+) -> ApiResult<AnalyzeImageResponse> {
+    let _shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .map_err(|_| ApiError::Internal("ANTHROPIC_API_KEY が設定されていません".into()))?;
+
+    let request_body = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 256,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": body.media_type,
+                        "data": body.image
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "このボトルの画像を見て、以下のJSON形式のみで答えてください:\n{\"name\":\"商品名（ブランド名と年数など）\",\"remaining_percent\":残量の推定パーセント(0-100の整数)}\n商品名が不明な場合はnull、残量が判断できない場合は50にしてください。JSONのみ返してください。"
+                }
+            ]
+        }]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let resp_json: serde_json::Value = resp.json().await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let text = resp_json["content"][0]["text"]
+        .as_str()
+        .ok_or_else(|| ApiError::Internal("Claude APIの応答が不正です".into()))?;
+
+    let text = text.trim();
+    let text = text.strip_prefix("```json").unwrap_or(text);
+    let text = text.strip_prefix("```").unwrap_or(text);
+    let text = text.strip_suffix("```").unwrap_or(text);
+    let text = text.trim();
+
+    let parsed: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| ApiError::Internal(format!("パース失敗: {} / レスポンス: {}", e, text)))?;
+
+    Ok(Json(AnalyzeImageResponse {
+        name:              parsed["name"].as_str().map(String::from),
+        remaining_percent: parsed["remaining_percent"].as_i64().map(|v| v.clamp(0, 100) as i32),
+    }))
+}
 
 // ════════════════════════════════════════════════════════════
 // 期限通知

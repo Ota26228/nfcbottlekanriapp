@@ -19,6 +19,7 @@ use bottlekanri::{
     handler_register_bottle, handler_get_shop_bottles, handler_update_bottle, handler_delete_bottle,
     handler_get_pending_bottles, handler_approve_bottle,
     handler_customer_request_bottle, handler_get_my_bottles,
+    handler_analyze_bottle_image,
     handler_notify_test,
     handler_admin_clear_magic_links,
     run_notification_loop,
@@ -173,6 +174,7 @@ async fn main() {
         .route("/v1/staff/bottles/pending", get(handler_get_pending_bottles))
         .route("/v1/staff/bottles/{id}", patch(handler_update_bottle).delete(handler_delete_bottle))
         .route("/v1/staff/bottles/{id}/approve", post(handler_approve_bottle))
+        .route("/v1/staff/bottles/analyze-image", post(handler_analyze_bottle_image))
         // テスト用（通知即時実行）
         .route("/v1/staff/notify-test", post(handler_notify_test))
         // 一時管理用
