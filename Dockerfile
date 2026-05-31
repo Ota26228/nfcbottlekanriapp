@@ -9,7 +9,7 @@ RUN cargo build --release
 FROM debian:bookworm-slim
 
 RUN apt-get update \
- && apt-get install -y libsqlite3-0 ca-certificates \
+ && apt-get install -y libsqlite3-0 ca-certificates sqlite3 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -20,6 +20,8 @@ pub struct AppState {
     pub pending_regs:               Arc<Mutex<HashMap<String, PasskeyRegistration>>>,
     pub pending_auths:              Arc<Mutex<HashMap<String, PasskeyAuthentication>>>,
     pub pending_discoverable_auths: Arc<Mutex<HashMap<String, PasskeyAuthentication>>>,
+    pub staff_pending_regs:         Arc<Mutex<HashMap<String, PasskeyRegistration>>>,
+    pub staff_pending_auths:        Arc<Mutex<HashMap<String, PasskeyAuthentication>>>,
 }
 
 // ─── エラー型 ──────────────────────────────────────────────────
@@ -70,6 +72,25 @@ pub struct Shop {
     pub name: String,
 }
 
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
+pub struct NearbyShop {
+    pub id:        i32,
+    pub name:      String,
+    pub latitude:  f64,
+    pub longitude: f64,
+    #[sqlx(skip)]
+    pub distance_km: f64,
+}
+
+fn haversine(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6371.0_f64;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    r * 2.0 * a.sqrt().asin()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Drink {
     pub id:      i32,
@@ -88,6 +109,7 @@ pub struct Bottle {
     pub status:            String,
     pub kept_at:           Option<DateTime<Utc>>,
     pub expires_at:        Option<DateTime<Utc>>,
+    pub last_extended_at:  Option<DateTime<Utc>>,
     pub email:             Option<String>,
 }
 
@@ -117,6 +139,7 @@ pub struct MyBottleItem {
     pub status:            String,
     pub kept_at:           Option<DateTime<Utc>>,
     pub expires_at:        Option<DateTime<Utc>>,
+    pub last_extended_at:  Option<DateTime<Utc>>,
 }
 
 // ─── 認証ヘルパー ──────────────────────────────────────────────
@@ -166,6 +189,17 @@ async fn get_authenticated_staff(
     .ok_or_else(|| ApiError::Unauthorized("スタッフセッションが無効です".into()))
 }
 
+async fn create_staff_session(pool: &SqlitePool, shop_id: i32) -> Result<String, ApiError> {
+    let token      = uuid::Uuid::new_v4().to_string();
+    let expires_at = Utc::now() + Duration::days(7);
+    sqlx::query(
+        "INSERT INTO staff_sessions (token, shop_id, expires_at) VALUES (?, ?, ?)"
+    )
+    .bind(&token).bind(shop_id).bind(expires_at)
+    .execute(pool).await.map_err(ApiError::from)?;
+    Ok(token)
+}
+
 async fn create_customer_session(pool: &SqlitePool, customer_id: i32) -> Result<String, ApiError> {
     let token      = uuid::Uuid::new_v4().to_string();
     let expires_at = Utc::now() + Duration::days(30);
@@ -182,6 +216,86 @@ async fn create_customer_session(pool: &SqlitePool, customer_id: i32) -> Result<
 }
 
 // ─── メール送信 ────────────────────────────────────────────────
+
+async fn send_staff_magic_link_email(to_email: &str, link: &str) -> Result<(), ApiError> {
+    let api_key = match std::env::var("RESEND_API_KEY") {
+        Ok(k) => k,
+        Err(_) => {
+            tracing::info!("=== スタッフマジックリンク (dev) === To: {} Link: {}", to_email, link);
+            return Ok(());
+        }
+    };
+    let from_addr = std::env::var("RESEND_FROM")
+        .unwrap_or_else(|_| "onboarding@resend.dev".to_string());
+    let payload = serde_json::json!({
+        "from": from_addr,
+        "to": [to_email],
+        "subject": "【ボトルキープ】スタッフログインリンク",
+        "html": format!(
+            "<p>以下のリンクをクリックしてダッシュボードにログインしてください。</p>\
+             <p><a href=\"{link}\">ログインする</a></p>\
+             <p>このリンクは15分で期限切れになります。</p>",
+            link = link
+        ),
+    });
+    let res = reqwest::Client::new()
+        .post("https://api.resend.com/emails")
+        .bearer_auth(&api_key)
+        .json(&payload)
+        .send().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !res.status().is_success() {
+        let msg = res.text().await.unwrap_or_default();
+        tracing::warn!("スタッフメール送信失敗: {}", msg);
+    }
+    Ok(())
+}
+
+async fn link_bottles_by_email(pool: &SqlitePool, customer_id: i32, email: &str) {
+    let n = sqlx::query(
+        "UPDATE bottles SET customer_id = ? WHERE email = ? AND customer_id IS NULL"
+    )
+    .bind(customer_id).bind(email)
+    .execute(pool).await;
+    match n {
+        Ok(r) => tracing::info!("メール紐付け: {}件 (customer_id={})", r.rows_affected(), customer_id),
+        Err(e) => tracing::warn!("メール紐付け失敗: {}", e),
+    }
+}
+
+async fn send_bottle_registered_email(
+    to_email: &str, guest_name: &str, shop_name: &str,
+    drink_name: &str, expires_at: &str,
+) -> Result<(), ApiError> {
+    let api_key = match std::env::var("RESEND_API_KEY") {
+        Ok(k) => k,
+        Err(_) => {
+            tracing::info!("=== ボトル登録通知 (dev mode) === To: {}", to_email);
+            return Ok(());
+        }
+    };
+    let from_addr = std::env::var("RESEND_FROM")
+        .unwrap_or_else(|_| "onboarding@resend.dev".to_string());
+    let body = format!(
+        "{}様\n\n{}にてボトルキープのご登録が完了しました。\n\nお酒: {}\n期限: {}\n\nご来店お待ちしております。",
+        guest_name, shop_name, drink_name, expires_at
+    );
+    let payload = serde_json::json!({
+        "from": from_addr,
+        "to": [to_email],
+        "subject": format!("【{}】ボトルキープ登録のお知らせ", shop_name),
+        "text": body,
+    });
+    let res = reqwest::Client::new()
+        .post("https://api.resend.com/emails")
+        .bearer_auth(&api_key)
+        .json(&payload)
+        .send().await.map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !res.status().is_success() {
+        let msg = res.text().await.unwrap_or_default();
+        return Err(ApiError::Internal(format!("Resend error: {}", msg)));
+    }
+    Ok(())
+}
 
 async fn send_magic_link_email(to_email: &str, link: &str) -> Result<(), ApiError> {
     let api_key = match std::env::var("RESEND_API_KEY") {
@@ -249,6 +363,66 @@ pub async fn handler_list_shops(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(shops))
+}
+
+// GET /v1/shops/nearby?lat=X&lng=Y
+#[derive(Deserialize)]
+pub struct NearbyQuery {
+    pub lat: f64,
+    pub lng: f64,
+    pub radius_km: Option<f64>,
+}
+
+pub async fn handler_nearby_shops(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<NearbyQuery>,
+) -> ApiResult<Vec<NearbyShop>> {
+    let radius = q.radius_km.unwrap_or(0.5);
+    // バウンディングボックスでSQL側を事前絞り込み（1度≒111km）
+    let lat_delta = radius / 111.0;
+    let lng_delta = radius / (111.0 * q.lat.to_radians().cos());
+    let shops = sqlx::query_as::<_, NearbyShop>(
+        "SELECT id, name, latitude, longitude FROM shops
+         WHERE latitude BETWEEN ? AND ?
+         AND longitude BETWEEN ? AND ?"
+    )
+    .bind(q.lat - lat_delta).bind(q.lat + lat_delta)
+    .bind(q.lng - lng_delta).bind(q.lng + lng_delta)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::from)?;
+
+    let mut nearby: Vec<NearbyShop> = shops
+        .into_iter()
+        .map(|mut s| {
+            s.distance_km = haversine(q.lat, q.lng, s.latitude, s.longitude);
+            s
+        })
+        .filter(|s| s.distance_km <= radius)
+        .collect();
+    nearby.sort_by(|a, b| a.distance_km.partial_cmp(&b.distance_km).unwrap());
+    Ok(Json(nearby))
+}
+
+// PATCH /v1/staff/shop/location
+#[derive(Deserialize)]
+pub struct UpdateLocationRequest {
+    pub latitude:  f64,
+    pub longitude: f64,
+}
+
+pub async fn handler_update_shop_location(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateLocationRequest>,
+) -> ApiResult<Shop> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+    sqlx::query("UPDATE shops SET latitude = ?, longitude = ? WHERE id = ?")
+        .bind(body.latitude).bind(body.longitude).bind(shop_id)
+        .execute(&state.pool).await.map_err(ApiError::from)?;
+    let shop = sqlx::query_as::<_, Shop>("SELECT id, name FROM shops WHERE id = ?")
+        .bind(shop_id).fetch_one(&state.pool).await.map_err(ApiError::from)?;
+    Ok(Json(shop))
 }
 
 pub async fn handler_get_shop(
@@ -495,6 +669,7 @@ pub async fn handler_verify_magic_link(
         }
     };
 
+    link_bottles_by_email(&state.pool, customer.id, &email).await;
     let token = create_customer_session(&state.pool, customer.id).await?;
     Ok(Json(AuthResponse { token, customer }))
 }
@@ -774,6 +949,9 @@ pub async fn handler_passkey_login_finish(
     .await
     .map_err(ApiError::from)?;
 
+    if let Some(ref email) = customer.email {
+        link_bottles_by_email(&state.pool, customer.id, email).await;
+    }
     let token = create_customer_session(&state.pool, customer.id).await?;
     Ok(Json(AuthResponse { token, customer }))
 }
@@ -785,8 +963,9 @@ pub async fn handler_passkey_login_finish(
 // POST /v1/staff/login
 #[derive(Deserialize)]
 pub struct StaffLoginRequest {
-    pub shop_id: i32,
-    pub pin:     String,
+    pub shop_id:   Option<i32>,
+    pub shop_name: Option<String>,
+    pub pin:       String,
 }
 
 #[derive(Serialize)]
@@ -810,14 +989,15 @@ pub async fn handler_staff_login(
 
 
 
-    let shop_with_pin = sqlx::query_as::<_, ShopWithPin>(
-        "SELECT id, name, pin FROM shops WHERE id = ?"
-    )
-    .bind(body.shop_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::from)?
-    .ok_or_else(|| ApiError::NotFound("店舗が見つかりません".into()))?;
+    let shop_with_pin: ShopWithPin = if let Some(id) = body.shop_id {
+        sqlx::query_as::<_, ShopWithPin>("SELECT id, name, pin FROM shops WHERE id = ?")
+            .bind(id).fetch_optional(&state.pool).await.map_err(ApiError::from)?
+    } else if let Some(ref name) = body.shop_name {
+        sqlx::query_as::<_, ShopWithPin>("SELECT id, name, pin FROM shops WHERE name = ?")
+            .bind(name.trim()).fetch_optional(&state.pool).await.map_err(ApiError::from)?
+    } else {
+        return Err(ApiError::BadRequest("shop_id か shop_name が必要です".into()));
+    }.ok_or_else(|| ApiError::NotFound("店舗が見つかりません".into()))?;
 
     let ok = bcrypt::verify(&body.pin, &shop_with_pin.pin)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -886,13 +1066,282 @@ pub async fn handler_staff_logout(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ════════════════════════════════════════════════════════════
+// ハンドラー — スタッフ認証（パスキー・メールリンク）
+// ════════════════════════════════════════════════════════════
+
+// PATCH /v1/staff/email
+#[derive(Deserialize)]
+pub struct UpdateStaffEmailRequest {
+    pub email: String,
+}
+
+pub async fn handler_staff_update_email(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateStaffEmailRequest>,
+) -> ApiResult<serde_json::Value> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+    let email = body.email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err(ApiError::BadRequest("メールアドレスを入力してください".into()));
+    }
+    sqlx::query("UPDATE shops SET email = ? WHERE id = ?")
+        .bind(&email).bind(shop_id)
+        .execute(&state.pool).await.map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({ "email": email })))
+}
+
+// GET /v1/staff/passkey/status
+pub async fn handler_staff_passkey_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<serde_json::Value> {
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM staff_passkeys WHERE shop_id = ?"
+    )
+    .bind(shop_id).fetch_one(&state.pool).await.map_err(ApiError::from)?;
+    let email: Option<String> = sqlx::query_scalar("SELECT email FROM shops WHERE id = ?")
+        .bind(shop_id).fetch_optional(&state.pool).await.map_err(ApiError::from)?
+        .flatten();
+    Ok(Json(serde_json::json!({ "registered": count > 0, "email": email })))
+}
+
+// GET /v1/staff/passkey/available  (認証不要)
+pub async fn handler_staff_passkey_available(
+    State(state): State<AppState>,
+) -> ApiResult<serde_json::Value> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM staff_passkeys")
+        .fetch_one(&state.pool).await.map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({ "available": count > 0 })))
+}
+
+// POST /v1/staff/passkey/register/start
+pub async fn handler_staff_passkey_reg_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<PasskeyRegStartResponse> {
+    use webauthn_rs::prelude::Uuid as WUuid;
+
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+    let shop_name: String = sqlx::query_scalar("SELECT name FROM shops WHERE id = ?")
+        .bind(shop_id).fetch_one(&state.pool).await.map_err(ApiError::from)?;
+
+    let user_uuid = WUuid::from_u128(shop_id as u128);
+    let username  = format!("shop-{}", shop_id);
+    let display   = shop_name.clone();
+
+    let (ccr, reg_state) = state.webauthn
+        .start_passkey_registration(user_uuid, &username, &display, None)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let session_key = format!("staff-{}", shop_id);
+    state.staff_pending_regs.lock().unwrap().insert(session_key.clone(), reg_state);
+
+    let challenge_json = serde_json::to_string(&ccr)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(PasskeyRegStartResponse { uuid: session_key, challenge_json }))
+}
+
+// POST /v1/staff/passkey/register/finish
+#[derive(Deserialize)]
+pub struct StaffPasskeyRegFinishRequest {
+    pub session_key: String,
+    pub credential:  serde_json::Value,
+}
+
+pub async fn handler_staff_passkey_reg_finish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<StaffPasskeyRegFinishRequest>,
+) -> ApiResult<StaffAuthResponse> {
+    use webauthn_rs::prelude::RegisterPublicKeyCredential;
+
+    let shop_id = get_authenticated_staff(&state.pool, &headers).await?;
+
+    let reg_state = state.staff_pending_regs.lock().unwrap()
+        .remove(&body.session_key)
+        .ok_or_else(|| ApiError::BadRequest("登録セッションが見つかりません".into()))?;
+
+    let reg_resp: RegisterPublicKeyCredential = serde_json::from_value(body.credential)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let passkey = state.webauthn
+        .finish_passkey_registration(&reg_resp, &reg_state)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let public_key = serde_json::to_string(&passkey)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    sqlx::query("DELETE FROM staff_passkeys WHERE shop_id = ?")
+        .bind(shop_id).execute(&state.pool).await.map_err(ApiError::from)?;
+
+    sqlx::query("INSERT INTO staff_passkeys (shop_id, public_key) VALUES (?, ?)")
+        .bind(shop_id).bind(&public_key)
+        .execute(&state.pool).await.map_err(ApiError::from)?;
+
+    let shop_name: String = sqlx::query_scalar("SELECT name FROM shops WHERE id = ?")
+        .bind(shop_id).fetch_one(&state.pool).await.map_err(ApiError::from)?;
+
+    let shop  = Shop { id: shop_id, name: shop_name };
+    let token = create_staff_session(&state.pool, shop_id).await?;
+    Ok(Json(StaffAuthResponse { token, shop }))
+}
+
+// POST /v1/staff/passkey/login/start
+pub async fn handler_staff_passkey_login_start(
+    State(state): State<AppState>,
+) -> ApiResult<PasskeyLoginStartResponse> {
+    use webauthn_rs::prelude::Passkey;
+
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT public_key FROM staff_passkeys")
+        .fetch_all(&state.pool).await.map_err(ApiError::from)?;
+
+    let passkeys: Vec<Passkey> = rows.iter()
+        .filter_map(|(json,)| serde_json::from_str(json).ok())
+        .collect();
+
+    if passkeys.is_empty() {
+        return Err(ApiError::BadRequest("登録済みのパスキーがありません".into()));
+    }
+
+    let (rcr, auth_state) = state.webauthn
+        .start_passkey_authentication(&passkeys)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    state.staff_pending_auths.lock().unwrap()
+        .insert(session_id.clone(), auth_state);
+
+    let challenge_json = serde_json::to_string(&rcr)
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(PasskeyLoginStartResponse { session_id, challenge_json }))
+}
+
+// POST /v1/staff/passkey/login/finish
+pub async fn handler_staff_passkey_login_finish(
+    State(state): State<AppState>,
+    Json(body): Json<PasskeyLoginFinishRequest>,
+) -> ApiResult<StaffAuthResponse> {
+    use webauthn_rs::prelude::{PublicKeyCredential, Passkey};
+
+    let auth_state = state.staff_pending_auths.lock().unwrap()
+        .remove(&body.session_id)
+        .ok_or_else(|| ApiError::BadRequest("認証セッションが見つかりません".into()))?;
+
+    let auth_resp: PublicKeyCredential = serde_json::from_value(body.credential)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let auth_result = state.webauthn
+        .finish_passkey_authentication(&auth_resp, &auth_state)
+        .map_err(|_| ApiError::Unauthorized("パスキー認証に失敗しました".into()))?;
+
+    let used_cred_id = auth_result.cred_id();
+
+    let rows: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT shop_id, public_key FROM staff_passkeys"
+    )
+    .fetch_all(&state.pool).await.map_err(ApiError::from)?;
+
+    let shop_id = rows.iter()
+        .find_map(|(sid, json)| {
+            serde_json::from_str::<Passkey>(json).ok()
+                .filter(|pk| pk.cred_id() == used_cred_id)
+                .map(|_| *sid)
+        })
+        .ok_or_else(|| ApiError::Unauthorized("店舗が見つかりません".into()))?;
+
+    let shop_name: String = sqlx::query_scalar("SELECT name FROM shops WHERE id = ?")
+        .bind(shop_id).fetch_one(&state.pool).await.map_err(ApiError::from)?;
+
+    let shop  = Shop { id: shop_id, name: shop_name };
+    let token = create_staff_session(&state.pool, shop_id).await?;
+    Ok(Json(StaffAuthResponse { token, shop }))
+}
+
+// POST /v1/staff/magic-link/send
+#[derive(Deserialize)]
+pub struct StaffMagicLinkSendRequest {
+    pub email: String,
+}
+
+pub async fn handler_staff_send_magic_link(
+    State(state): State<AppState>,
+    Json(body): Json<StaffMagicLinkSendRequest>,
+) -> Result<StatusCode, ApiError> {
+    let email = body.email.trim().to_lowercase();
+
+    let shop_id: Option<i32> = sqlx::query_scalar(
+        "SELECT id FROM shops WHERE email = ?"
+    )
+    .bind(&email)
+    .fetch_optional(&state.pool).await.map_err(ApiError::from)?;
+
+    let shop_id = shop_id
+        .ok_or_else(|| ApiError::NotFound("このメールアドレスでは店舗が見つかりません".into()))?;
+
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM staff_magic_links WHERE shop_id = ? AND expires_at > datetime('now', '+14 minutes')"
+    )
+    .bind(shop_id).fetch_one(&state.pool).await.map_err(ApiError::from)?;
+
+    if recent > 0 {
+        return Err(ApiError::BadRequest("直前にリンクを送信済みです。しばらく待ってから再試行してください。".into()));
+    }
+
+    sqlx::query("DELETE FROM staff_magic_links WHERE shop_id = ? OR expires_at < datetime('now')")
+        .bind(shop_id).execute(&state.pool).await.map_err(ApiError::from)?;
+
+    let token = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO staff_magic_links (token, shop_id, expires_at) VALUES (?, ?, datetime('now', '+15 minutes'))"
+    )
+    .bind(&token).bind(shop_id)
+    .execute(&state.pool).await.map_err(ApiError::from)?;
+
+    let app_url = std::env::var("APP_URL")
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let link = format!("{}/admin/verify?token={}", app_url, token);
+
+    send_staff_magic_link_email(&email, &link).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// POST /v1/staff/magic-link/verify
+pub async fn handler_staff_verify_magic_link(
+    State(state): State<AppState>,
+    Json(body): Json<MagicLinkVerifyRequest>,
+) -> ApiResult<StaffAuthResponse> {
+    let shop_id: i32 = sqlx::query_scalar(
+        "SELECT shop_id FROM staff_magic_links WHERE token = ? AND used = 0 AND expires_at > datetime('now')"
+    )
+    .bind(&body.token)
+    .fetch_optional(&state.pool).await.map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::BadRequest("リンクが無効または期限切れです".into()))?;
+
+    sqlx::query("UPDATE staff_magic_links SET used = 1 WHERE token = ?")
+        .bind(&body.token)
+        .execute(&state.pool).await.map_err(ApiError::from)?;
+
+    let shop_name: String = sqlx::query_scalar("SELECT name FROM shops WHERE id = ?")
+        .bind(shop_id).fetch_one(&state.pool).await.map_err(ApiError::from)?;
+
+    let shop  = Shop { id: shop_id, name: shop_name };
+    let token = create_staff_session(&state.pool, shop_id).await?;
+    Ok(Json(StaffAuthResponse { token, shop }))
+}
+
 // POST /v1/staff/bottles
 #[derive(Deserialize)]
 pub struct RegisterBottleRequest {
-    pub guest_name:  String,
-    pub drink_name:  String,
-    pub expires_days: Option<i32>,
-    pub email:       Option<String>,
+    pub guest_name:        String,
+    pub drink_name:        String,
+    pub expires_days:      Option<i32>,
+    pub email:             Option<String>,
+    pub remaining_percent: Option<i32>,
 }
 
 pub async fn handler_register_bottle(
@@ -904,17 +1353,19 @@ pub async fn handler_register_bottle(
 
     let now        = Utc::now();
     let expires_at = now + Duration::days(body.expires_days.unwrap_or(90) as i64);
+    let remaining  = body.remaining_percent.unwrap_or(100).clamp(0, 100);
 
     let result = sqlx::query(
         "INSERT INTO bottles
          (shop_id, guest_name, drink_name, kept_at, expires_at, remaining_percent, email, status)
-         VALUES (?, ?, ?, ?, ?, 100, ?, 'active')"
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'active')"
     )
     .bind(shop_id)
     .bind(&body.guest_name)
     .bind(&body.drink_name)
     .bind(now)
     .bind(expires_at)
+    .bind(remaining)
     .bind(&body.email)
     .execute(&state.pool)
     .await
@@ -922,13 +1373,32 @@ pub async fn handler_register_bottle(
 
     let bottle = sqlx::query_as::<_, Bottle>(
         "SELECT id, shop_id, customer_id, guest_name, drink_name, remaining_percent,
-                status, kept_at, expires_at, email
+                status, kept_at, expires_at, last_extended_at, email
          FROM bottles WHERE id = ?"
     )
     .bind(result.last_insert_rowid())
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::from)?;
+
+    if let Some(ref email) = body.email {
+        // 既存顧客と即紐づけ
+        if let Ok(Some(cid)) = sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM customers WHERE email = ?"
+        ).bind(email).fetch_optional(&state.pool).await {
+            sqlx::query("UPDATE bottles SET customer_id = ? WHERE id = ? AND customer_id IS NULL")
+                .bind(cid).bind(result.last_insert_rowid())
+                .execute(&state.pool).await.ok();
+        }
+
+        let shop_name = sqlx::query_scalar::<_, String>("SELECT name FROM shops WHERE id = ?")
+            .bind(shop_id).fetch_optional(&state.pool).await.unwrap_or(None)
+            .unwrap_or_else(|| "お店".to_string());
+        let expires_str = expires_at.format("%Y年%m月%d日").to_string();
+        let _ = send_bottle_registered_email(
+            email, &body.guest_name, &shop_name, &body.drink_name, &expires_str,
+        ).await;
+    }
 
     Ok(Json(bottle))
 }
@@ -942,7 +1412,7 @@ pub async fn handler_get_shop_bottles(
 
     let bottles = sqlx::query_as::<_, Bottle>(
         "SELECT id, shop_id, customer_id, guest_name, drink_name, remaining_percent,
-                status, kept_at, expires_at, email
+                status, kept_at, expires_at, last_extended_at, email
          FROM bottles WHERE shop_id = ? AND status = 'active'
          ORDER BY kept_at DESC"
     )
@@ -993,13 +1463,16 @@ pub async fn handler_update_bottle(
             .execute(&state.pool).await.map_err(ApiError::from)?;
     }
     if let Some(exp) = body.expires_at {
-        sqlx::query("UPDATE bottles SET expires_at = ? WHERE id = ?")
+        sqlx::query("UPDATE bottles SET expires_at = ?, last_extended_at = datetime('now') WHERE id = ?")
             .bind(exp).bind(bottle_id)
             .execute(&state.pool).await.map_err(ApiError::from)?;
 
         let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, String)>(
-            "SELECT b.email, b.guest_name, b.drink_name, s.name
-             FROM bottles b JOIN shops s ON s.id = b.shop_id WHERE b.id = ?"
+            "SELECT COALESCE(b.email, c.email), b.guest_name, b.drink_name, s.name
+             FROM bottles b
+             JOIN shops s ON s.id = b.shop_id
+             LEFT JOIN customers c ON c.id = b.customer_id
+             WHERE b.id = ?"
         )
         .bind(bottle_id)
         .fetch_optional(&state.pool)
@@ -1022,7 +1495,7 @@ pub async fn handler_update_bottle(
 
     let bottle = sqlx::query_as::<_, Bottle>(
         "SELECT id, shop_id, customer_id, guest_name, drink_name, remaining_percent,
-                status, kept_at, expires_at, email
+                status, kept_at, expires_at, last_extended_at, email
          FROM bottles WHERE id = ?"
     )
     .bind(bottle_id)
@@ -1135,7 +1608,8 @@ pub async fn handler_approve_bottle(
         "UPDATE bottles SET status = 'active',
          drink_name = ?, remaining_percent = ?,
          kept_at = datetime('now'),
-         expires_at = datetime('now', '+' || ? || ' days')
+         expires_at = datetime('now', '+' || ? || ' days'),
+         guest_name = COALESCE((SELECT display_name FROM customers WHERE id = bottles.customer_id), guest_name)
          WHERE id = ? AND shop_id = ? AND status = 'pending'"
     )
     .bind(body.drink_name.trim())
@@ -1153,7 +1627,7 @@ pub async fn handler_approve_bottle(
 
     let bottle = sqlx::query_as::<_, Bottle>(
         "SELECT id, shop_id, customer_id, guest_name, drink_name, remaining_percent,
-                status, kept_at, expires_at, email
+                status, kept_at, expires_at, last_extended_at, email
          FROM bottles WHERE id = ?"
     )
     .bind(bottle_id)
@@ -1173,16 +1647,32 @@ pub async fn handler_get_my_bottles(
 
     let items = sqlx::query_as::<_, MyBottleItem>(
         "SELECT b.id, s.name as shop_name, b.drink_name,
-                b.remaining_percent, b.status, b.kept_at, b.expires_at
+                b.remaining_percent, b.status, b.kept_at, b.expires_at, b.last_extended_at
          FROM bottles b
          JOIN shops s ON s.id = b.shop_id
-         WHERE b.customer_id = ? AND b.status IN ('active', 'pending')
+         WHERE (b.customer_id = ?
+             OR (b.customer_id IS NULL AND b.email IS NOT NULL AND b.email = (
+                 SELECT email FROM customers WHERE id = ? AND email IS NOT NULL
+             )))
+           AND b.status IN ('active', 'pending')
          ORDER BY b.status DESC, s.name, b.kept_at DESC"
     )
+    .bind(customer.id)
     .bind(customer.id)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::from)?;
+
+    // 期限切れを除外（expires_at が過去のものは表示しない）
+    let now = Utc::now();
+    let items: Vec<MyBottleItem> = items.into_iter()
+        .filter(|b| b.expires_at.map_or(true, |exp| exp > now))
+        .collect();
+
+    // メール一致のボトルを即時紐づけ
+    if let Some(ref email) = customer.email {
+        link_bottles_by_email(&state.pool, customer.id, email).await;
+    }
 
     Ok(Json(items))
 }

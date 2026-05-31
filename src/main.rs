@@ -10,12 +10,17 @@ use bcrypt;
 use bottlekanri::{
     AppState,
     handler_list_shops, handler_get_shop, handler_register_shop,
+    handler_nearby_shops, handler_update_shop_location,
     handler_list_shop_drinks, handler_add_drink, handler_delete_drink,
     handler_request_magic_link, handler_verify_magic_link,
     handler_get_me, handler_logout, handler_update_profile, handler_passkey_status,
     handler_passkey_reg_start, handler_passkey_reg_finish,
     handler_passkey_login_start, handler_passkey_login_finish,
     handler_staff_login, handler_staff_me, handler_staff_logout,
+    handler_staff_update_email, handler_staff_passkey_status, handler_staff_passkey_available,
+    handler_staff_passkey_reg_start, handler_staff_passkey_reg_finish,
+    handler_staff_passkey_login_start, handler_staff_passkey_login_finish,
+    handler_staff_send_magic_link, handler_staff_verify_magic_link,
     handler_register_bottle, handler_get_shop_bottles, handler_update_bottle, handler_delete_bottle,
     handler_get_pending_bottles, handler_approve_bottle,
     handler_customer_request_bottle, handler_get_my_bottles,
@@ -46,6 +51,18 @@ async fn main() {
     sqlx::query(include_str!("../schema.sql"))
         .execute(&pool).await.expect("スキーマの作成に失敗しました");
 
+    // shops.latitude / longitude カラム追加マイグレーション
+    let has_lat: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('shops') WHERE name='latitude'"
+    ).fetch_one(&pool).await.unwrap_or(0);
+    if has_lat == 0 {
+        sqlx::query("ALTER TABLE shops ADD COLUMN latitude REAL")
+            .execute(&pool).await.expect("latitude カラム追加失敗");
+        sqlx::query("ALTER TABLE shops ADD COLUMN longitude REAL")
+            .execute(&pool).await.expect("longitude カラム追加失敗");
+        tracing::info!("shops 位置情報カラムマイグレーション完了");
+    }
+
     // status カラム追加マイグレーション
     let has_status: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('bottles') WHERE name='status'"
@@ -66,6 +83,26 @@ async fn main() {
         sqlx::query("ALTER TABLE bottles ADD COLUMN customer_id INTEGER REFERENCES customers(id)")
             .execute(&pool).await.expect("customer_id カラム追加失敗");
         tracing::info!("customer_id カラムマイグレーション完了");
+    }
+
+    // shops.email カラム追加マイグレーション
+    let has_email: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('shops') WHERE name='email'"
+    ).fetch_one(&pool).await.unwrap_or(0);
+    if has_email == 0 {
+        sqlx::query("ALTER TABLE shops ADD COLUMN email TEXT")
+            .execute(&pool).await.expect("shops.email カラム追加失敗");
+        tracing::info!("shops.email カラムマイグレーション完了");
+    }
+
+    // last_extended_at カラム追加マイグレーション
+    let has_extended: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('bottles') WHERE name='last_extended_at'"
+    ).fetch_one(&pool).await.unwrap_or(0);
+    if has_extended == 0 {
+        sqlx::query("ALTER TABLE bottles ADD COLUMN last_extended_at DATETIME")
+            .execute(&pool).await.expect("last_extended_at カラム追加失敗");
+        tracing::info!("last_extended_at カラムマイグレーション完了");
     }
 
     // nfc_uid カラム削除マイグレーション
@@ -127,6 +164,8 @@ async fn main() {
         pending_regs:               Arc::new(Mutex::new(HashMap::new())),
         pending_auths:              Arc::new(Mutex::new(HashMap::new())),
         pending_discoverable_auths: Arc::new(Mutex::new(HashMap::new())),
+        staff_pending_regs:         Arc::new(Mutex::new(HashMap::new())),
+        staff_pending_auths:        Arc::new(Mutex::new(HashMap::new())),
     };
 
     // ─── CORS ────────────────────────────────────────────────
@@ -147,8 +186,10 @@ async fn main() {
     let app = Router::new()
         // ショップ
         .route("/v1/shops", get(handler_list_shops).post(handler_register_shop))
+        .route("/v1/shops/nearby", get(handler_nearby_shops))
         .route("/v1/shops/{shop_id}", get(handler_get_shop))
         .route("/v1/shops/{shop_id}/drinks", get(handler_list_shop_drinks))
+        .route("/v1/staff/shop/location", axum::routing::patch(handler_update_shop_location))
         // お酒管理
         .route("/v1/staff/drinks", post(handler_add_drink))
         .route("/v1/staff/drinks/{id}", axum::routing::delete(handler_delete_drink))
@@ -168,6 +209,15 @@ async fn main() {
         .route("/v1/staff/login",   post(handler_staff_login))
         .route("/v1/staff/me",      get(handler_staff_me))
         .route("/v1/staff/logout",  post(handler_staff_logout))
+        .route("/v1/staff/email",   axum::routing::patch(handler_staff_update_email))
+        .route("/v1/staff/passkey/available",        get(handler_staff_passkey_available))
+        .route("/v1/staff/passkey/status",          get(handler_staff_passkey_status))
+        .route("/v1/staff/passkey/register/start",  post(handler_staff_passkey_reg_start))
+        .route("/v1/staff/passkey/register/finish", post(handler_staff_passkey_reg_finish))
+        .route("/v1/staff/passkey/login/start",     post(handler_staff_passkey_login_start))
+        .route("/v1/staff/passkey/login/finish",    post(handler_staff_passkey_login_finish))
+        .route("/v1/staff/magic-link/send",         post(handler_staff_send_magic_link))
+        .route("/v1/staff/magic-link/verify",       post(handler_staff_verify_magic_link))
         .route("/v1/staff/bottles",
             get(handler_get_shop_bottles).post(handler_register_bottle)
         )

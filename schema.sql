@@ -1,7 +1,9 @@
 CREATE TABLE IF NOT EXISTS shops (
-    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    pin  TEXT NOT NULL DEFAULT '1234'
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    name      TEXT NOT NULL,
+    pin       TEXT NOT NULL DEFAULT '1234',
+    latitude  REAL,
+    longitude REAL
 );
 
 CREATE TABLE IF NOT EXISTS staff_sessions (
@@ -21,6 +23,7 @@ CREATE TABLE IF NOT EXISTS bottles (
     status             TEXT DEFAULT 'active',
     kept_at            DATETIME,
     expires_at         DATETIME,
+    last_extended_at   DATETIME,
     email              TEXT,
     FOREIGN KEY (shop_id)   REFERENCES shops(id),
     FOREIGN KEY (customer_id) REFERENCES customers(id)
@@ -73,4 +76,17 @@ CREATE TABLE IF NOT EXISTS passkey_credentials (
     public_key  TEXT NOT NULL,
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+
+CREATE TABLE IF NOT EXISTS staff_passkeys (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop_id    INTEGER NOT NULL REFERENCES shops(id),
+    public_key TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS staff_magic_links (
+    token      TEXT PRIMARY KEY,
+    shop_id    INTEGER NOT NULL REFERENCES shops(id),
+    expires_at DATETIME NOT NULL,
+    used       INTEGER DEFAULT 0
 );
